@@ -244,9 +244,10 @@ discovery query per org.
 |:--|:--|:--|
 | `--targets FILE` | auto-discover | One target per line, `org` or `org/repo`; `#` comments allowed. A bare `org` maps to `<org>/<workflow-repo>`. Without the flag, every org the token reaches is discovered via `orgs --csv`. |
 | `--workflow-repo NAME` (alias `--repo`) | `veracode` | Central workflow repository name inside each org. Also labels logs re-analyzed with `--analyze-dir`. |
-| `--limit N` | 50 | Workflow runs listed per repository during discovery. |
-| `--runs-per-repo N` | 10 | Runs whose logs are fetched and classified, per repository. |
-| `--failed-only` / `--no-failed-only` | on | Restrict discovery to `failure,cancelled,timed_out,action_required`. Gate failures mark the run failed, so they are always included. |
+| `--limit N` | 200 | Workflow runs listed per repository during discovery, newest first. The central repo's run list is shared by all Veracode workflows, so keep this comfortably larger than `--runs-per-repo`. |
+| `--runs-per-repo N` | 10 | Runs whose logs are fetched and classified, per repository, chosen by the selection policy below. |
+| `--max-age-days N` | 30 | Ignore matched runs older than this (0 disables). Keeps triage on current, re-triggerable failures instead of stale history. Runs with a missing timestamp are kept, never silently dropped. |
+| `--failed-only` / `--no-failed-only` | on | Restrict discovery to `failure,cancelled,timed_out,action_required,startup_failure,stale`. `startup_failure` catches invalid workflow files that never start a job. Gate failures mark the run failed, so they are always included. |
 | `--cli PATH` | `github-workflow-cli.py` | Path to the CLI. |
 | `--python PATH` | current interpreter | Interpreter used to invoke the CLI. |
 | `--output-dir DIR` | `workflow-output` | A timestamped `sast-bulk-*` or `sca-bulk-*` folder is created per invocation. Reports are written per org, never as one aggregate: `index.md` at the root plus `orgs/<org>/` folders each containing that org's summary, CSV, JSON, and raw run logs, alongside `config-files/<org>/`. |
@@ -280,6 +281,24 @@ workflow-output/sast-bulk-<timestamp>/
 Each `orgs/<org>/` folder is self-contained: the report, the machine outputs,
 and the raw logs the classifications were derived from, so a single org folder
 can be zipped and handed to that org's owners.
+
+### Run selection (freshness guarantees)
+
+Getting the latest, most actionable runs is the core of the helpers, so the
+selection chain is defensive end to end:
+
+| Layer | Guarantee |
+|:--|:--|
+| API ordering | Discovery requests `sort=created&order=desc` explicitly; newest-first is an API parameter, not an assumption. |
+| Defensive re-sort | The helper re-sorts matched runs by created time, then run id, so it never depends on upstream output ordering. |
+| Age gate | Runs older than `--max-age-days` (default 30) are dropped and counted, keeping the report about current, re-triggerable failures. Missing timestamps never cause a silent drop. |
+| Coverage pass | Run names encode the scan target (`Software Composition Analysis - verademo`), so the newest run per distinct name is selected first: every still-failing target gets its latest failure into the quota before any target gets a second one. A single flapping repo cannot starve the rest. |
+| Backfill pass | Remaining quota is filled with the next-newest runs overall, giving recent failure history for flapping targets. |
+| Visibility | Every discovery prints `Runs: matched M, selected N, skipped K older than Xd`, plus explicit notes when nothing matched in the window (raise `--limit`) or everything matched was too old (raise `--max-age-days`). |
+
+The helpers deliberately do not use the CLI's `--name-break` during discovery:
+combined with a conclusion filter it stops at the first page containing any
+match, which can skip a target whose latest failure sits one page deeper.
 
 ### Runner detection
 
@@ -379,5 +398,5 @@ any recurring one.
 | Multi-org cache partitioning | The `protection_ops` backup cache is keyed by org/repo/branch (org is passed as the namespace), so a token spanning multiple orgs is partitioned correctly. This depends on `protection_ops` honoring that namespace; confirm it on your build. |
 | Token hygiene | `repo-revert-commit` authenticates with a bare clone URL and an `http.extraheader` injected via the environment (`GIT_CONFIG_*`, git 2.31+), so the token is never written into argv or the temp clone's `.git/config`. The temp dir is removed in a `finally` block. |
 | Sensitive output | `logs` and `contents` print raw output that may contain build secrets. Treat report folders and fetched logs as sensitive artifacts. |
-| API cost | `contents` is a single API call by default; `--with-dates` adds one call per file (N+1), so use it only on small repos or specific paths. Helper discovery is one `workflows` query per org thanks to the central-repo model and `--name-break`. |
+| API cost | `contents` is a single API call by default; `--with-dates` adds one call per file (N+1), so use it only on small repos or specific paths. Helper discovery is at most `ceil(--limit / 100)` paginated calls per org thanks to the central-repo model (two pages at the default 200). |
 | Runner labels | Run logs contain the resolved runner image, not the literal `default:runs_on` label. The configured label is in the org's `veracode.yml`, which the helpers now save under `config-files/<org>/` automatically. |
