@@ -417,7 +417,7 @@ def parse_args() -> argparse.Namespace:
                         help="Also report runs where no SAST failure was observed")
     parser.add_argument("--fetch-configs", action=argparse.BooleanOptionalAction, default=True,
                         help=("Also save each org's workflow config files (default: veracode.yml "
-                              "and repo-list.yml) under config-files/<org>/ in the output folder."))
+                              "and repo_list.yml) under config-files/<org>/ in the output folder."))
     parser.add_argument("--config-file", dest="config_files", action="append", metavar="NAME",
                         help=("Config file name to fetch from the workflow repo root; repeatable. "
                               "Overrides the default list when given."))
@@ -935,14 +935,14 @@ def infer_filename(path: Path) -> tuple[str, str]:
 
 
 
-DEFAULT_CONFIG_FILES = ("veracode.yml", "repo-list.yml")
+DEFAULT_CONFIG_FILES = ("veracode.yml", "repo_list.yml")
 
 
 def fetch_config_files(args: argparse.Namespace, result_dir: Path,
                        workflow_repo: str, fetched_orgs: set[str]) -> None:
     """Save the org's workflow config files under config-files/<org>/.
 
-    Fetches each configured file (default: veracode.yml and repo-list.yml)
+    Fetches each configured file (default: veracode.yml and repo_list.yml)
     from the root of the central workflow repository. Missing files are
     normal in some orgs and only produce a note, never a failure.
     """
