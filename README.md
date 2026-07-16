@@ -249,9 +249,11 @@ discovery query per org.
 | `--failed-only` / `--no-failed-only` | on | Restrict discovery to `failure,cancelled,timed_out,action_required`. Gate failures mark the run failed, so they are always included. |
 | `--cli PATH` | `github-workflow-cli.py` | Path to the CLI. |
 | `--python PATH` | current interpreter | Interpreter used to invoke the CLI. |
-| `--output-dir DIR` | `workflow-output` | A timestamped `sast-bulk-*` or `sca-bulk-*` folder is created per invocation with raw discovery logs, per-run logs, and the three reports. |
+| `--output-dir DIR` | `workflow-output` | A timestamped `sast-bulk-*` or `sca-bulk-*` folder is created per invocation with raw discovery logs, per-run logs, the three reports, and a `config-files/` folder. |
 | `--analyze-dir DIR` | | Skip fetching; re-classify previously collected `*-sast-NNN.log` or `*-sca-NNN.log` files. No token needed. Ideal when iterating on rules. |
 | `--include-ok` | off | Also report runs with no observed failure (SAST) or clean gate passes (SCA). |
+| `--fetch-configs` / `--no-fetch-configs` | on | Also save each org's workflow config files from the workflow repo root under `config-files/<org>/` in the output folder. Missing files produce a note, never a failure. |
+| `--config-file NAME` | `veracode.yml`, `repo-list.yml` | Config file to fetch; repeatable. Overrides the default list when given. Saved flat by base name inside the org folder. |
 | `--fail-fast` | off | Stop on the first collection error instead of continuing. |
 
 Helper exit codes: 0 all collection succeeded, 1 at least one discovery or log
@@ -297,6 +299,7 @@ cancellation line never masks the real dependency error underneath it.
 |:--|:--|
 | `sast-summary.md` | Findings grouped by cause with run link, branch, timestamp, failing job, runner, pipeline progress, evidence line, and the concrete remediation. Cleanup failures are real failures but not scan blockers, so they sit in a "Secondary issues" section at the bottom and never mask the primary SAST cause. |
 | `sast-findings.csv` / `.json` | Full field set per run, including stage statuses, runner fields, and log paths. |
+| `config-files/<org>/` | Each org's `veracode.yml` and `repo-list.yml` (or the `--config-file` list) fetched from the workflow repo root, one folder per org. Cross-reference `default:runs_on` and thresholds against the failures in the same report. |
 
 ```bash
 python helpers/bulk-sast-analyzer.py                         # all reachable orgs
@@ -325,7 +328,10 @@ is split accordingly.
 It fetches the complete run log (no `--relevant-only`; SCA job names do not
 match the SAST pipeline patterns) and writes `sca-summary.md`,
 `sca-findings.csv`, and `sca-findings.json` with the same layout conventions
-as the SAST helper.
+as the SAST helper, plus the same `config-files/<org>/` folder. That puts the
+resolved gate threshold from the logs and the configured
+`break_build_severity_threshold` from `veracode.yml` side by side in one
+output folder.
 
 ```bash
 python helpers/bulk-sca-analyzer.py                          # all reachable orgs
@@ -348,4 +354,4 @@ any recurring one.
 | Token hygiene | `repo-revert-commit` authenticates with a bare clone URL and an `http.extraheader` injected via the environment (`GIT_CONFIG_*`, git 2.31+), so the token is never written into argv or the temp clone's `.git/config`. The temp dir is removed in a `finally` block. |
 | Sensitive output | `logs` and `contents` print raw output that may contain build secrets. Treat report folders and fetched logs as sensitive artifacts. |
 | API cost | `contents` is a single API call by default; `--with-dates` adds one call per file (N+1), so use it only on small repos or specific paths. Helper discovery is one `workflows` query per org thanks to the central-repo model and `--name-break`. |
-| Runner labels | Run logs contain the resolved runner image, not the literal `default:runs_on` label. To audit the configured label itself, fetch the workflow YAML with `contents` and read it there. |
+| Runner labels | Run logs contain the resolved runner image, not the literal `default:runs_on` label. The configured label is in the org's `veracode.yml`, which the helpers now save under `config-files/<org>/` automatically. |
