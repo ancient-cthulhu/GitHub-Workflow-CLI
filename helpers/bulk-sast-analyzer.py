@@ -415,6 +415,12 @@ def parse_args() -> argparse.Namespace:
                         help="Re-analyze previously collected logs instead of fetching")
     parser.add_argument("--include-ok", action="store_true",
                         help="Also report runs where no SAST failure was observed")
+    parser.add_argument("--fetch-configs", action=argparse.BooleanOptionalAction, default=True,
+                        help=("Also save each org's workflow config files (default: veracode.yml "
+                              "and repo-list.yml) under config-files/<org>/ in the output folder."))
+    parser.add_argument("--config-file", dest="config_files", action="append", metavar="NAME",
+                        help=("Config file name to fetch from the workflow repo root; repeatable. "
+                              "Overrides the default list when given."))
     parser.add_argument("--fail-fast", action="store_true")
     return parser.parse_args()
 
@@ -928,6 +934,41 @@ def infer_filename(path: Path) -> tuple[str, str]:
     return (match.group(1), match.group(2)) if match else ("unknown", "unknown")
 
 
+
+DEFAULT_CONFIG_FILES = ("veracode.yml", "repo-list.yml")
+
+
+def fetch_config_files(args: argparse.Namespace, result_dir: Path,
+                       workflow_repo: str, fetched_orgs: set[str]) -> None:
+    """Save the org's workflow config files under config-files/<org>/.
+
+    Fetches each configured file (default: veracode.yml and repo-list.yml)
+    from the root of the central workflow repository. Missing files are
+    normal in some orgs and only produce a note, never a failure.
+    """
+    organization = workflow_repo.split("/", 1)[0]
+    if organization in fetched_orgs:
+        return
+    fetched_orgs.add(organization)
+    config_dir = result_dir / "config-files" / safe_target_name(organization)
+    for name in (args.config_files or list(DEFAULT_CONFIG_FILES)):
+        command = [args.python_executable, str(args.cli),
+                   "contents", "--repo", workflow_repo, "--path", name]
+        try:
+            completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       encoding="utf-8", errors="replace", text=True, check=False)
+        except OSError as exc:
+            print(f"WARNING: unable to fetch {workflow_repo}/{name}: {exc}", file=sys.stderr)
+            continue
+        if completed.returncode != 0 or not (completed.stdout or "").strip():
+            print(f"NOTE: {name} not found in {workflow_repo}")
+            continue
+        config_dir.mkdir(parents=True, exist_ok=True)
+        destination = config_dir / Path(name).name
+        destination.write_text(completed.stdout, encoding="utf-8")
+        print(f"Saved config: {destination}")
+
+
 def discover_organizations(args: argparse.Namespace, result_dir: Path) -> list[str]:
     """Ask the CLI which organizations the single token can reach."""
     discovery_file = result_dir / "orgs-discovery.log"
@@ -989,9 +1030,12 @@ def main() -> int:
             else:
                 workflow_repositories.append(f"{target}/{args.workflow_repo}")
 
+        fetched_config_orgs: set[str] = set()
         for workflow_repo in dict.fromkeys(workflow_repositories):
             organization = workflow_repo.split("/", 1)[0]
             target_name = safe_target_name(workflow_repo)
+            if args.fetch_configs:
+                fetch_config_files(args, result_dir, workflow_repo, fetched_config_orgs)
             discovery_file = result_dir / f"{target_name}-sast-discovery.log"
             discovery = [args.python_executable, str(args.cli),
                          "workflows", "--repo", workflow_repo, "--limit", str(args.limit),
@@ -1023,7 +1067,10 @@ def main() -> int:
                     break
 
     write_reports(result_dir, findings, args.include_ok)
+    config_root = result_dir / "config-files"
     print(f"\nAnalyzed: {len(findings)}")
+    if config_root.is_dir():
+        print(f"Configs:  {config_root}")
     print(f"Summary:  {result_dir / 'sast-summary.md'}")
     print(f"CSV:      {result_dir / 'sast-findings.csv'}")
     print(f"JSON:     {result_dir / 'sast-findings.json'}")
