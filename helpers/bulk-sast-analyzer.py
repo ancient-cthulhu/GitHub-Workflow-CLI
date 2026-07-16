@@ -6,8 +6,6 @@ GitHub token can reach (or an explicit target list), uses the GitHub Workflow
 CLI to fetch complete run logs, retains build/AutoPackager/upload/prescan/
 pipeline-scan/policy-scan jobs, and classifies the real operational failure.
 
-Cleanup failures are tracked but reported separately at the bottom of the
-Markdown summary; they never mask the primary SAST failure.
 """
 
 from __future__ import annotations
