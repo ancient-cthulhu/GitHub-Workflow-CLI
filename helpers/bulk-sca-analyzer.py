@@ -335,7 +335,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workflow-repo", "--repo", dest="workflow_repo", default="veracode",
                         help=("Name of the central repository that hosts the Veracode workflows "
                               "in each organization (default: veracode)."))
-    parser.add_argument("--limit", type=positive_int, default=50,
+    parser.add_argument("--limit", type=positive_int, default=200,
                         help="Maximum workflow runs to list per repository during discovery")
     parser.add_argument("--runs-per-repo", type=positive_int, default=10,
                         help="Maximum runs to fetch logs for, per repository")
@@ -356,6 +356,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-file", dest="config_files", action="append", metavar="NAME",
                         help=("Config file name to fetch from the workflow repo root; repeatable. "
                               "Overrides the default list when given."))
+    parser.add_argument("--max-age-days", type=int, default=30,
+                        help=("Ignore matched runs older than this many days (default: 30; "
+                              "0 disables). Keeps triage focused on current, re-triggerable "
+                              "failures instead of stale history."))
     parser.add_argument("--fail-fast", action="store_true")
     return parser.parse_args()
 
@@ -408,7 +412,7 @@ def run_capture(command: list[str], output_file: Path) -> tuple[int, str]:
     return code, output
 
 
-def extract_runs(output: str, maximum: int) -> list[RunMeta]:
+def extract_runs(output: str) -> list[RunMeta]:
     """Parse discovery output (CSV preferred, URL fallback) into run metadata."""
     runs: list[RunMeta] = []
     seen: set[str] = set()
@@ -431,7 +435,77 @@ def extract_runs(output: str, maximum: int) -> list[RunMeta]:
             if run_id not in seen:
                 seen.add(run_id)
                 runs.append(RunMeta(run_id=run_id))
-    return runs[:maximum]
+    return runs
+
+
+
+def parse_run_time(value: str):
+    """Parse an ISO-8601 run timestamp; None when absent or malformed."""
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def run_sort_key(run: RunMeta):
+    """Newest first: created timestamp, then run id (higher id is newer)."""
+    created = parse_run_time(run.created_at)
+    created_key = created.timestamp() if created else 0.0
+    id_key = int(run.run_id) if run.run_id.isdigit() else 0
+    return (-created_key, -id_key)
+
+
+def select_runs(runs: list[RunMeta], maximum: int, max_age_days: int) -> tuple[list[RunMeta], int, int]:
+    """Pick the most recent, most actionable runs.
+
+    This is the freshness core of the helper, deliberately defensive:
+    1. Age gate: drop runs older than max_age_days (0 disables). Runs with a
+       missing or unparsable timestamp are kept, never silently dropped.
+    2. Deterministic newest-first ordering by created time then run id, so we
+       never depend on upstream output ordering.
+    3. Coverage pass: the newest run per distinct run name first. Run names
+       encode the scan target (e.g. "Software Composition Analysis -
+       verademo"), so every still-failing target gets its latest failure into
+       the quota before any target gets a second one.
+    4. Backfill pass: remaining quota filled with the next-newest runs overall
+       (recent failure history for flapping targets).
+
+    Returns (selected, matched_count, skipped_by_age).
+    """
+    matched = len(runs)
+    if max_age_days > 0:
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age_days)
+        fresh = []
+        for run in runs:
+            created = parse_run_time(run.created_at)
+            if created is None or created >= cutoff:
+                fresh.append(run)
+        runs = fresh
+    skipped_by_age = matched - len(runs)
+
+    ordered = sorted(runs, key=run_sort_key)
+    selected: list[RunMeta] = []
+    chosen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for run in ordered:                      # coverage: newest per scan target
+        if len(selected) >= maximum:
+            break
+        name = getattr(run, "name", "") or ""
+        if name and name in seen_names:
+            continue
+        seen_names.add(name)
+        selected.append(run)
+        chosen_ids.add(run.run_id)
+    for run in ordered:                      # backfill: next newest overall
+        if len(selected) >= maximum:
+            break
+        if run.run_id not in chosen_ids:
+            selected.append(run)
+            chosen_ids.add(run.run_id)
+    selected.sort(key=run_sort_key)
+    return selected, matched, skipped_by_age
 
 
 def line_job_name(line: str) -> str:
@@ -1005,9 +1079,10 @@ def main() -> int:
             discovery_file = logs_dir / f"{target_name}-sca-discovery.log"
             discovery = [args.python_executable, str(args.cli),
                          "workflows", "--repo", workflow_repo, "--limit", str(args.limit),
-                         "--name", SCA_WORKFLOW_NAME, "--name-break", "--csv"]
+                         "--name", SCA_WORKFLOW_NAME, "--csv"]
             if args.failed_only:
-                discovery.extend(["--conclusion", "failure,cancelled,timed_out,action_required"])
+                discovery.extend(["--conclusion",
+                                  "failure,cancelled,timed_out,action_required,startup_failure,stale"])
             print(f"Discovering: {workflow_repo}")
             code, output = run_capture(discovery, discovery_file)
             if code != 0:
@@ -1016,7 +1091,21 @@ def main() -> int:
                 if args.fail_fast:
                     break
                 continue
-            for run_meta in extract_runs(output, args.runs_per_repo):
+            matched_runs = extract_runs(output)
+            selected_runs, matched, skipped_by_age = select_runs(
+                matched_runs, args.runs_per_repo, args.max_age_days)
+            if not matched:
+                print(f"NOTE: no matching runs in the newest {args.limit} runs of "
+                      f"{workflow_repo}; if failures are older, raise --limit")
+            elif not selected_runs:
+                print(f"NOTE: {matched} matching run(s) in {workflow_repo} but all older "
+                      f"than {args.max_age_days} days; raise --max-age-days to include them")
+            else:
+                print(f"Runs: matched {matched}, selected {len(selected_runs)} "
+                      f"(newest per scan target first)"
+                      + (f", skipped {skipped_by_age} older than {args.max_age_days}d"
+                         if skipped_by_age else ""))
+            for run_meta in selected_runs:
                 run_id = run_meta.run_id
                 log = logs_dir / f"{target_name}-sca-{run_id}.log"
                 # SCA jobs are not named like SAST pipeline jobs, so fetch the
