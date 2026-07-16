@@ -6,6 +6,8 @@ GitHub token can reach (or an explicit target list), uses the GitHub Workflow
 CLI to fetch complete run logs, retains build/AutoPackager/upload/prescan/
 pipeline-scan/policy-scan jobs, and classifies the real operational failure.
 
+Cleanup failures are tracked but reported separately at the bottom of the
+Markdown summary; they never mask the primary SAST failure.
 """
 
 from __future__ import annotations
@@ -331,8 +333,10 @@ def parse_args() -> argparse.Namespace:
               "An organization-only entry processes every repository in that "
               "organization. Omit to auto-discover all accessible organizations."),
     )
-    parser.add_argument("--repo", default="veracode",
-                        help="Repository name assumed for logs analyzed with --analyze-dir (default: veracode)")
+    parser.add_argument("--workflow-repo", "--repo", dest="workflow_repo", default="veracode",
+                        help=("Name of the central repository that hosts the Veracode workflows "
+                              "in each organization (default: veracode). Bare organization targets "
+                              "map to <org>/<workflow-repo>."))
     parser.add_argument("--limit", type=positive_int, default=50,
                         help="Maximum workflow runs to list per repository during discovery")
     parser.add_argument("--runs-per-repo", "--runs-per-org", dest="runs_per_repo",
@@ -383,10 +387,6 @@ def extract_csv_column(output: str, column: str) -> list[str]:
     except csv.Error:
         return []
     return list(dict.fromkeys(values))
-
-
-def extract_repositories(output: str, organization: str) -> list[str]:
-    return [f"{organization}/{name}" for name in extract_csv_column(output, "name")]
 
 
 def safe_target_name(repository: str) -> str:
@@ -876,7 +876,7 @@ def main() -> int:
                 continue
             organization, run_id = infer_filename(path)
             manifest = path.with_name(f"{path.stem}-jobs.json")
-            findings.append(classify(path, organization, f"{organization}/{args.repo}",
+            findings.append(classify(path, organization, f"{organization}/{args.workflow_repo}",
                                      RunMeta(run_id=run_id),
                                      manifest if manifest.is_file() else None))
     else:
@@ -897,29 +897,14 @@ def main() -> int:
 
         workflow_repositories: list[str] = []
         for target in requested_targets:
+            # Explicit org/repo targets are used as-is. A bare organization
+            # maps directly to its central workflow repository (the Veracode
+            # workflows run only there and scan the org's other repositories
+            # as sources), so there is no need to enumerate every repo.
             if "/" in target:
                 workflow_repositories.append(target)
-                continue
-            organization = target
-            repository_list_file = result_dir / f"{safe_target_name(organization)}-repos-discovery.log"
-            repository_list_command = [args.python_executable, str(args.cli),
-                                       "repos", "--org", organization, "--csv"]
-            print(f"Discovering repositories: {organization}")
-            code, output = run_capture(repository_list_command, repository_list_file)
-            if code != 0:
-                operational_failures += 1
-                print(f"WARNING: repository discovery failed for {organization}", file=sys.stderr)
-                if args.fail_fast:
-                    break
-                continue
-            repositories = extract_repositories(output, organization)
-            if not repositories:
-                operational_failures += 1
-                print(f"WARNING: no repositories found for {organization}", file=sys.stderr)
-                if args.fail_fast:
-                    break
-                continue
-            workflow_repositories.extend(repositories)
+            else:
+                workflow_repositories.append(f"{target}/{args.workflow_repo}")
 
         for workflow_repo in dict.fromkeys(workflow_repositories):
             organization = workflow_repo.split("/", 1)[0]
