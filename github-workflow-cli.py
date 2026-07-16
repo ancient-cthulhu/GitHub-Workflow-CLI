@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-GitHub Workflow CLI - Query GitHub workflows and logs for a specific tenant.
-Supports listing repos, listing workflow runs, and fetching logs for individual runs.
+GitHub Workflow CLI - Query and remediate GitHub Actions workflows, repos, issues,
+and protection settings. One GitHub token (GITHUB_TOKEN, or GH_TOKEN if unset)
+authenticates every command; whatever orgs it is authorized for is what the CLI
+can reach. Use the `orgs` command to see the token's reach.
 """
 
 from __future__ import annotations
@@ -9,33 +11,28 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
-import fnmatch
 import io
 import json
 import os
 import re
 from pathlib import Path
-import shlex
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime
 import tempfile
-from enable_debug import protection_ops
-from ruamel.yaml import YAML
 
 try:
-    import requests
-except ImportError:
-    requests = None
+    from ruamel.yaml import YAML
+except ImportError:  # Optional: only repo-write-file --operation merge needs it.
+    YAML = None
 
-TENANT_ACX = "ACX"
-TENANT_IPG = "IPG"
-TENANT_TOKEN_ENV = {
-    TENANT_ACX: "GITHUB_TOKEN_ACX",
-    TENANT_IPG: "GITHUB_TOKEN_IPG",
-}
-VALID_TENANTS = frozenset(TENANT_TOKEN_ENV.keys())
+try:
+    from enable_debug import protection_ops
+except ImportError:  # Optional: only branch-protection/rulesets commands need it.
+    protection_ops = None
+
+TOKEN_ENV_VARS = ("GITHUB_TOKEN", "GH_TOKEN")
 GITHUB_API_BASE = "https://api.github.com"
 
 SUBPROCESS_TIMEOUT = 600  # 10 minutes
@@ -77,18 +74,25 @@ def load_env_file(path: str = ".env") -> None:
         print(f"Warning: Could not read {path}: {exc}", file=sys.stderr)
 
 
-def get_tenant_token(tenant: str) -> str:
-    """Retrieve the GitHub token for the given tenant."""
-    env_name = TENANT_TOKEN_ENV.get(tenant)
-    if not env_name:
-        raise ValueError(f"Unknown tenant: {tenant!r}")
-    token = os.environ.get(env_name)
-    if not token:
+def get_github_token() -> str:
+    """Retrieve the GitHub token from GITHUB_TOKEN, or GH_TOKEN if unset."""
+    for env_name in TOKEN_ENV_VARS:
+        token = os.environ.get(env_name, "").strip()
+        if token:
+            return token
+    raise SystemExit(
+        "Error: No GitHub token found. Set GITHUB_TOKEN (or GH_TOKEN) in the "
+        "environment or a local .env file."
+    )
+
+
+def require_protection_ops() -> None:
+    """Fail clearly when a protection command is used without enable_debug."""
+    if protection_ops is None:
         raise SystemExit(
-            f"Error: Environment variable {env_name} is not set "
-            f"(required for tenant {tenant})."
+            "Error: This command requires the internal 'enable_debug' module "
+            "(protection_ops), which is not importable in this environment."
         )
-    return token
 
 
 def build_gh_env(token: str | None = None) -> dict[str, str]:
@@ -118,12 +122,14 @@ def run_gh_command(cmd: list[str], env: dict[str, str]) -> dict | list:
         return json.loads(result.stdout)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"gh command timed out after {SUBPROCESS_TIMEOUT} seconds")
+    except OSError as exc:
+        raise RuntimeError(f"Unable to run gh: {exc}")
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Failed to parse gh output as JSON: {exc}")
 
 
 def run_git_command(cmd: list[str], env: dict[str, str]) -> str:
-    """Execute a gh CLI command and return parsed JSON output."""
+    """Execute a git command and return its stdout."""
     try:
         result = subprocess.run(
             cmd,
@@ -140,9 +146,9 @@ def run_git_command(cmd: list[str], env: dict[str, str]) -> str:
         return result.stdout
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"git command timed out after {SUBPROCESS_TIMEOUT} seconds")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to parse git output: {exc}")
-    
+    except OSError as exc:
+        raise RuntimeError(f"Unable to run git: {exc}")
+
 
 @dataclass
 class Repo:
@@ -274,7 +280,6 @@ def format_csv(headers: list[str], rows: list[list]) -> str:
 
 
 def cmd_repos(
-    tenant: str,
     org: str,
     token: str,
     name_filter: str | None = None,
@@ -343,7 +348,6 @@ def cmd_repos(
 
 
 def cmd_workflows(
-    tenant: str,
     repo: str,
     token: str,
     status: str | None = None,
@@ -466,7 +470,6 @@ def cmd_workflows(
 
 
 def cmd_run_view(
-    tenant: str,
     run_id: int,
     token: str,
     repo: str,
@@ -661,7 +664,6 @@ def fetch_logs_via_api(
     return filtered or full_logs, manifest
 
 def cmd_logs(
-    tenant: str,
     run_id: int,
     token: str,
     repo: str,
@@ -693,7 +695,6 @@ def cmd_logs(
 
 
 def cmd_issues(
-    tenant: str,
     repo: str,
     token: str,
     state: str | None = None,
@@ -882,7 +883,6 @@ def cmd_issues(
 
 
 def cmd_org_apps(
-    tenant: str,
     org: str,
     token: str,
     name_filter: str | None = None,
@@ -977,7 +977,6 @@ def cmd_org_apps(
 
 
 def cmd_token_info(
-    tenant: str,
     token: str,
 ) -> int:
     """Display information about the GitHub token being used."""
@@ -1012,7 +1011,6 @@ def cmd_token_info(
             return 1
 
         print("Token Information:")
-        print(f"  Tenant: {tenant}")
         print(f"  User: {user_data.get('login', 'N/A')}")
         print(f"  Name: {user_data.get('name', 'N/A')}")
         print(f"  Email: {user_data.get('email', 'N/A')}")
@@ -1057,8 +1055,69 @@ def cmd_token_info(
         return 1
 
 
+def cmd_orgs(
+    token: str,
+    output_format: str = "table",
+) -> int:
+    """List every organization the token can reach and print a scope verdict.
+
+    Tries /user/orgs first (classic PATs with read:org). Falls back to
+    /user/memberships/orgs for tokens where /user/orgs returns nothing.
+    """
+    env = build_gh_env(token)
+    orgs: list[dict] = []
+
+    try:
+        data = run_gh_command(
+            ["gh", "api", "user/orgs", "--paginate"], env=env
+        )
+        if isinstance(data, list):
+            orgs = [item for item in data if isinstance(item, dict)]
+    except RuntimeError:
+        orgs = []
+
+    if not orgs:
+        try:
+            data = run_gh_command(
+                ["gh", "api", "user/memberships/orgs", "--paginate"], env=env
+            )
+            if isinstance(data, list):
+                orgs = [
+                    item.get("organization")
+                    for item in data
+                    if isinstance(item, dict) and isinstance(item.get("organization"), dict)
+                ]
+        except RuntimeError as exc:
+            print(f"Error: unable to list organizations: {exc}", file=sys.stderr)
+            return 1
+
+    rows = []
+    seen: set[str] = set()
+    for item in orgs:
+        login = (item.get("login") or "").strip()
+        if not login or login in seen:
+            continue
+        seen.add(login)
+        rows.append([login, item.get("url", ""), item.get("description") or ""])
+
+    headers = ["org", "url", "description"]
+    if output_format == "csv":
+        print(format_csv(headers, rows), end="")
+    else:
+        print(format_table(headers, rows))
+
+    count = len(rows)
+    verdict = (
+        "No organizations reachable (user-scoped token?)" if count == 0
+        else f"Single-org token: {rows[0][0]}" if count == 1
+        else f"Multi-org token: {count} organizations"
+    )
+    # Keep CSV stdout machine-parseable; verdict goes to stderr in that mode.
+    print(verdict, file=sys.stderr if output_format == "csv" else sys.stdout)
+    return 0
+
+
 def cmd_org_actions_permissions(
-    tenant: str,
     org: str,
     token: str,
 ) -> int:
@@ -1115,7 +1174,6 @@ def cmd_org_actions_permissions(
 
 
 def cmd_repo_actions_permissions(
-    tenant: str,
     repo: str,
     token: str,
     output_format: str = "table",
@@ -1222,7 +1280,6 @@ def cmd_repo_actions_permissions(
     
 
 def cmd_org_rulesets(
-    tenant: str,
     org: str,
     token: str,
     ruleset_id: str | None = None,
@@ -1329,7 +1386,6 @@ def cmd_org_rulesets(
 
 
 def cmd_org_app_view(
-    tenant: str,
     org: str,
     app_name: str,
     token: str,
@@ -1422,7 +1478,6 @@ def cmd_org_app_view(
 
 
 def cmd_issue_create(
-    tenant: str,
     repo: str,
     token: str,
     title: str,
@@ -1569,7 +1624,6 @@ def cmd_issue_create(
 
 
 def cmd_issue_view(
-    tenant: str,
     repo: str,
     issue_number: int,
     token: str,
@@ -1783,7 +1837,6 @@ def fetch_tree_contents(
 
 
 def cmd_contents(
-    tenant: str,
     repo: str,
     token: str,
     path: str | None = None,
@@ -2037,7 +2090,6 @@ def cmd_contents(
 
 
 def cmd_repo_branches(
-    tenant: str,
     repo: str,
     token: str,
     name_filter: str | None = None,
@@ -2147,7 +2199,6 @@ def cmd_repo_branches(
 
 
 def cmd_repo_commits(
-    tenant: str,
     repo: str,
     branch: str,
     token: str,
@@ -2253,17 +2304,13 @@ def cmd_repo_commits(
 
 
 def cmd_repo_branch_protection(
-    tenant: str,
     repo: str,
     branch: str,
     token: str,
     operation: str,
 ) -> int:
-    """List commits for a repository branch.
-
-    Default mode shows top-level commit info for recent commits.
-    Verbose mode shows deeper commit details (full SHA and full message).
-    """
+    """Disable, restore, or inspect branch protection for a repository branch."""
+    require_protection_ops()
     env = build_gh_env(token)
 
     try:
@@ -2273,13 +2320,13 @@ def cmd_repo_branch_protection(
             return 1
         org, repo = parts
  
-        metadata = f"tenant: {tenant}, org: {org}, repo: {repo}, branch: {branch}"
+        metadata = f"org: {org}, repo: {repo}, branch: {branch}"
 
         if operation == "disable":
-            protection_ops.disable_branch_protection(GITHUB_API_BASE, org, repo, branch, token, tenant)
+            protection_ops.disable_branch_protection(GITHUB_API_BASE, org, repo, branch, token, org)
         
         if operation == "restore":
-            cached_protection = protection_ops.get_latest_protection_for_branch(tenant, org, repo, branch)
+            cached_protection = protection_ops.get_latest_protection_for_branch(org, org, repo, branch)
             if not cached_protection:
                 print(f"Invalid cached protection for {metadata}", file=sys.stderr)
                 return 1
@@ -2299,7 +2346,7 @@ def cmd_repo_branch_protection(
             print(json.dumps(current_protection, indent=2))
         
         if operation == "cached":
-            cached_protection = protection_ops.get_latest_protection_for_branch(tenant, org, repo, branch)
+            cached_protection = protection_ops.get_latest_protection_for_branch(org, org, repo, branch)
             if not cached_protection:
                 print(f"Invalid cached protection for {metadata}", file=sys.stderr)
                 return 1
@@ -2376,11 +2423,14 @@ def cmd_repo_revert_commit(
         return 1
 
 
-yaml = YAML()
-yaml.preserve_quotes = True
-yaml.default_flow_style = False
-yaml.indent(mapping=2, sequence=4, offset=2)
-yaml.width = 2**32
+if YAML is not None:
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.default_flow_style = False
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    yaml.width = 2**32
+else:
+    yaml = None
 
 
 def merge_lists_by_name(source_list: list, destination_list: list) -> None:
@@ -2450,6 +2500,10 @@ def obj_to_yml_str(obj, options=None) -> str:
 
 
 def upsert_yaml_keys(source_content: str, remote_content: str) -> str:
+    if yaml is None:
+        raise RuntimeError(
+            "The 'ruamel.yaml' package is required for --operation merge."
+        )
     source_file_yml = yaml.load(source_content)
     remote_file_yml = yaml.load(remote_content)
     merge_yaml_dicts(source_file_yml, remote_file_yml) # remote file contains merged content
@@ -2459,7 +2513,6 @@ def upsert_yaml_keys(source_content: str, remote_content: str) -> str:
 
 
 def cmd_repo_write_file(
-    tenant: str,
     repo: str,
     branch: str,
     destination_file_path: str,
@@ -2482,9 +2535,11 @@ def cmd_repo_write_file(
     branch_protection_disabled = None
     encountered_error = False
 
+    require_protection_ops()
     parts = repo.split("/")
     if len(parts) != 2:
         print(f"Invalid repo format: {repo}", file=sys.stderr)
+        return 1
     org, repo_name = parts
 
     try:
@@ -2493,18 +2548,24 @@ def cmd_repo_write_file(
         get_cmd = [
             "gh", "api", "-X", "GET", api_endpoint
         ]
-        get_data = run_gh_command(get_cmd, env=env)
+        try:
+            get_data = run_gh_command(get_cmd, env=env)
+        except RuntimeError as exc:
+            # A missing file is expected when creating it for the first time.
+            if "404" not in str(exc):
+                raise
+            get_data = {}
         if not isinstance(get_data, dict):
             raise ValueError(f"Error: Unexpected response format from \"{" ".join(get_cmd)}\"")
         get_sha = get_data.get("sha")
 
         try:
-            if not cmd_repo_branch_protection(tenant, repo, branch, token, "disable"): 
+            if not cmd_repo_branch_protection(repo, branch, token, "disable"): 
                 branch_protection_disabled = True
             print(f"{repo}@{branch}: branch protection disabled: {branch_protection_disabled}")
         except Exception as e:
             print(f"{repo}@{branch}: failed to disable branch protection: {e}")
-        repo_rulesets_disabled = protection_ops.disable_repository_rulesets(GITHUB_API_BASE, org, repo, token, None)
+        repo_rulesets_disabled = protection_ops.disable_repository_rulesets(GITHUB_API_BASE, org, repo_name, token, None)
         if repo_rulesets_disabled:
             print(f"{repo}: repository rulesets disabled: {repo_rulesets_disabled}")
         org_rulesets_disabled = protection_ops.disable_org_rulesets(GITHUB_API_BASE, org, token, None)
@@ -2536,12 +2597,10 @@ def cmd_repo_write_file(
                 raise ValueError(f"Error: file {source_path} does not exist")
 
             merged_content = source_path.read_text()
-            action_label = "Created"
-                
-            existing_content = base64.b64decode(get_data.get("content", "")).decode("utf-8")
-            action_label = "Updated"
+            action_label = "Updated" if get_sha else "Created"
 
-            if operation == "merge":
+            if operation == "merge" and get_sha:
+                existing_content = base64.b64decode(get_data.get("content", "")).decode("utf-8")
                 merged_content = upsert_yaml_keys(source_content=merged_content, remote_content=existing_content)
 
             encoded_content = base64.b64encode(merged_content.encode("utf-8")).decode("utf-8")
@@ -2567,7 +2626,7 @@ def cmd_repo_write_file(
         # return 1
     finally:
         if branch_protection_disabled: 
-            cmd_repo_branch_protection(tenant, repo, branch, token, "restore")
+            cmd_repo_branch_protection(repo, branch, token, "restore")
             print(f"{repo}@{branch}: branch protection restored")
         if repo_rulesets_disabled:
             protection_ops.restore_repository_rulesets(GITHUB_API_BASE, org, repo_name, token, repo_rulesets_disabled, None)
@@ -2582,20 +2641,35 @@ def cmd_repo_write_file(
     return 0
 
 
+def _handle_termination_signal(signum: int, frame) -> None:
+    """Convert termination signals into SystemExit so finally blocks run.
+
+    repo-write-file disables branch protection and rulesets and restores them
+    in finally; a raw signal death would leave protections off. Only SIGKILL
+    or a host crash can bypass this.
+    """
+    raise SystemExit(128 + signum)
+
+
+def install_signal_handlers() -> None:
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handle_termination_signal)
+        except (ValueError, OSError):
+            pass
+
+
 def main() -> int:
     """Main entry point."""
+    install_signal_handlers()
     load_env_file()
 
     parser = argparse.ArgumentParser(
         description="GitHub Workflow CLI - Query workflows and logs"
     )
-    parser.add_argument(
-        "--tenant",
-        required=True,
-        choices=sorted(VALID_TENANTS),
-        help="GitHub tenant (IPG or ACX)",
-    )
-
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     org_actions_perms_parser = subparsers.add_parser("org-actions-permissions", help="View GitHub Actions permissions for an organization")
@@ -2604,6 +2678,16 @@ def main() -> int:
     )
 
     token_info_parser = subparsers.add_parser("token-info", help="Show information about the GitHub token being used")
+
+    orgs_parser = subparsers.add_parser("orgs", help="List organizations the token can access, with a single/multi-org verdict")
+    orgs_parser.add_argument(
+        "--csv",
+        dest="output_format",
+        action="store_const",
+        const="csv",
+        default="table",
+        help="Output as CSV",
+    )
 
     org_app_view_parser = subparsers.add_parser("org-app", help="View settings for a GitHub app installed in an organization")
     org_app_view_parser.add_argument(
@@ -2906,20 +2990,18 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        token = get_tenant_token(args.tenant)
-    except (ValueError, SystemExit) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        token = get_github_token()
+    except SystemExit as exc:
+        print(exc, file=sys.stderr)
         return 1
 
     if args.command == "org-actions-permissions":
         return cmd_org_actions_permissions(
-            args.tenant,
             args.org,
             token,
         )
     elif args.command == "repos":
         return cmd_repos(
-            args.tenant,
             args.org,
             token,
             name_filter=args.name,
@@ -2927,34 +3009,28 @@ def main() -> int:
         )
     elif args.command == "token-info":
         return cmd_token_info(
-            args.tenant,
             token,
+        )
+    elif args.command == "orgs":
+        return cmd_orgs(
+            token,
+            output_format=args.output_format,
         )
     elif args.command == "org-app":
         return cmd_org_app_view(
-            args.tenant,
             args.org,
             args.name,
             token,
         )
     elif args.command == "org-apps":
         return cmd_org_apps(
-            args.tenant,
             args.org,
             token,
             name_filter=args.name,
             output_format=args.output_format,
         )
-    elif args.command == "repos":
-        return cmd_repos(
-            args.tenant,
-            args.org,
-            token,
-            output_format=args.output_format,
-        )
     elif args.command == "workflows":
         return cmd_workflows(
-            args.tenant,
             args.repo,
             token,
             status=args.status,
@@ -2966,14 +3042,12 @@ def main() -> int:
         )
     elif args.command == "run":
         return cmd_run_view(
-            args.tenant,
             args.id,
             token,
             repo=args.repo,
         )
     elif args.command == "logs":
         return cmd_logs(
-            args.tenant,
             args.run_id,
             token,
             repo=args.repo,
@@ -2983,7 +3057,6 @@ def main() -> int:
         )
     elif args.command == "issues":
         return cmd_issues(
-            args.tenant,
             args.repo,
             token,
             state=args.state,
@@ -2993,7 +3066,6 @@ def main() -> int:
         )
     elif args.command == "issue-create":
         return cmd_issue_create(
-            args.tenant,
             args.repo,
             token,
             title=args.title,
@@ -3003,14 +3075,12 @@ def main() -> int:
         )
     elif args.command == "issue":
         return cmd_issue_view(
-            args.tenant,
             args.repo,
             args.number,
             token,
         )
     elif args.command == "contents":
         return cmd_contents(
-            args.tenant,
             args.repo,
             token,
             path=args.path,
@@ -3019,7 +3089,6 @@ def main() -> int:
         )
     elif args.command == "repo-branches":
         return cmd_repo_branches(
-            args.tenant,
             args.repo,
             token,
             name_filter=args.name,
@@ -3027,7 +3096,6 @@ def main() -> int:
         )
     elif args.command == "repo-commits":
         return cmd_repo_commits(
-            args.tenant,
             args.repo,
             args.branch,
             token,
@@ -3037,7 +3105,6 @@ def main() -> int:
         )
     elif args.command == "repo-branch-protection":
         return cmd_repo_branch_protection(
-            args.tenant,
             args.repo,
             args.branch,
             token,
@@ -3045,7 +3112,6 @@ def main() -> int:
         )
     elif args.command == "repo-write-file":
         return cmd_repo_write_file(
-            args.tenant,
             args.repo,
             args.branch,
             destination_file_path=args.destination_file,
@@ -3063,7 +3129,6 @@ def main() -> int:
         )
     elif args.command == "org-rulesets":
         return cmd_org_rulesets(
-            args.tenant,
             args.org,
             token,
             args.ruleset_id,
@@ -3071,7 +3136,6 @@ def main() -> int:
         )
     elif args.command in ("repo-actions-permissions", "rap"):
         return cmd_repo_actions_permissions(
-            args.tenant,
             args.repo,
             token,
             output_format=args.output_format,
