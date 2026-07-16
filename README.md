@@ -10,8 +10,10 @@ workflow integration. Target any org or repo per command with `--org` / `--repo`
 * Python 3.12+ (uses PEP 701 nested-quote f-strings).
 * `gh` and `git` on `PATH` (git 2.31+, for env-injected auth in
   `repo-revert-commit`).
-* Python packages `requests` and `ruamel.yaml`, plus the internal `enable_debug`
-  module providing `protection_ops`.
+* Python package `ruamel.yaml` (only for `repo-write-file --operation merge`)
+  and the internal `enable_debug` module providing `protection_ops` (only for
+  branch-protection, ruleset, and `repo-write-file` commands). Both are optional
+  imports; every read command works without them.
 
 ## Authentication
 
@@ -23,8 +25,8 @@ overriding variables already set in the environment.
 
 ```bash
 export GITHUB_TOKEN=ghp_xxx
-python gh_workflow_cli.py token-info     # user + scopes
-python gh_workflow_cli.py orgs           # which orgs the token covers
+python github-workflow-cli.py token-info     # user + scopes
+python github-workflow-cli.py orgs           # which orgs the token covers
 ```
 
 `orgs` answers whether a token is scoped to one org or several. It lists every
@@ -65,7 +67,7 @@ These recipes run fleet-wide. They use only `--csv` output and standard shell, s
 they are safe to adapt. Run them in `bash`. Set these once:
 
 ```bash
-CLI="python gh_workflow_cli.py"
+CLI="python github-workflow-cli.py"
 ORG=my-org
 export GITHUB_TOKEN=ghp_xxx
 ```
@@ -191,7 +193,7 @@ If the token spans several orgs, loop over `orgs` (CSV column 1 is `org`) and
 nest any recipe above:
 
 ```bash
-for ORG in $($CLI orgs --csv | tail -n +2); do
+for ORG in $($CLI orgs --csv | tail -n +2 | cut -d, -f1); do
   echo "=== $ORG ==="
   $CLI repos --org "$ORG" --csv > "repos-$ORG.csv"
   # ... run a recipe here with $ORG ...
@@ -223,3 +225,35 @@ Tips: list before you mutate, append per-repo failures to a log and keep going
 * `contents` is a single API call by default. `--with-dates` adds a last-commit
   date per file, which costs one API call per file (N+1); use it only on small
   repos or specific paths.
+
+## Helper: bulk SAST triage
+
+`helpers/bulk-sast-analyzer.py` runs fleet-wide Veracode SAST failure triage on
+top of the CLI. With no arguments it discovers every organization the token can
+reach (via `orgs`), enumerates repositories, finds recent failed "Static Code
+Analysis" runs, pulls the build/AutoPackager/upload/prescan/scan job logs, and
+classifies the root cause of each failure against a signature rule set
+(credentials, private feeds, dependency resolution per ecosystem, disk/memory,
+TLS/proxy, prescan module errors, scan timeouts, policy gates, runner loss,
+cancellations, and more).
+
+```bash
+export GITHUB_TOKEN=ghp_xxx
+python helpers/bulk-sast-analyzer.py                       # all reachable orgs
+python helpers/bulk-sast-analyzer.py --targets targets.txt # explicit org/repo list
+python helpers/bulk-sast-analyzer.py --analyze-dir DIR     # re-analyze saved logs
+```
+
+Outputs per invocation (under `workflow-output/sast-bulk-<timestamp>/`):
+
+* `sast-summary.md`: findings grouped by cause, each with the run link, branch,
+  timestamp, failing job, pipeline progress, evidence line, and the concrete
+  remediation. Cleanup failures are real failures but not scan blockers, so they
+  are reported in a separate "Secondary issues" section at the bottom and never
+  mask the primary SAST cause.
+* `sast-findings.csv` / `sast-findings.json`: the complete field set per run for
+  machine consumption (includes `result`, statuses per stage, and log paths).
+
+Unclassified failures are reported with their evidence line and the code
+`UNCLASSIFIED_SAST_FAILURE`; add a `Rule` entry for any recurring one so the
+classifier keeps improving.
