@@ -249,7 +249,7 @@ discovery query per org.
 | `--failed-only` / `--no-failed-only` | on | Restrict discovery to `failure,cancelled,timed_out,action_required`. Gate failures mark the run failed, so they are always included. |
 | `--cli PATH` | `github-workflow-cli.py` | Path to the CLI. |
 | `--python PATH` | current interpreter | Interpreter used to invoke the CLI. |
-| `--output-dir DIR` | `workflow-output` | A timestamped `sast-bulk-*` or `sca-bulk-*` folder is created per invocation with raw discovery logs, per-run logs, the three reports, and a `config-files/` folder. |
+| `--output-dir DIR` | `workflow-output` | A timestamped `sast-bulk-*` or `sca-bulk-*` folder is created per invocation. Reports are written per org, never as one aggregate: `index.md` at the root plus `orgs/<org>/` folders each containing that org's summary, CSV, JSON, and raw run logs, alongside `config-files/<org>/`. |
 | `--analyze-dir DIR` | | Skip fetching; re-classify previously collected `*-sast-NNN.log` or `*-sca-NNN.log` files. No token needed. Ideal when iterating on rules. |
 | `--include-ok` | off | Also report runs with no observed failure (SAST) or clean gate passes (SCA). |
 | `--fetch-configs` / `--no-fetch-configs` | on | Also save each org's workflow config files from the workflow repo root under `config-files/<org>/` in the output folder. Missing files produce a note, never a failure. |
@@ -258,6 +258,28 @@ discovery query per org.
 
 Helper exit codes: 0 all collection succeeded, 1 at least one discovery or log
 fetch failed (findings are still written), 2 usage or environment error.
+
+### Output layout (per org, not one big report)
+
+Reports are generated per organization so each org's failures can be reviewed
+and fixed in isolation, with a fleet `index.md` for navigation:
+
+```
+workflow-output/sast-bulk-<timestamp>/
+  index.md                      # one row per org: runs, failures, top cause, link
+  config-files/
+    <org>/veracode.yml          # plus repo-list.yml when present
+  orgs/
+    <org>/
+      sast-summary.md           # that org's triage report (sca-summary.md for SCA)
+      sast-findings.csv
+      sast-findings.json
+      logs/                     # raw discovery and per-run logs for that org
+```
+
+Each `orgs/<org>/` folder is self-contained: the report, the machine outputs,
+and the raw logs the classifications were derived from, so a single org folder
+can be zipped and handed to that org's owners.
 
 ### Runner detection
 
@@ -295,11 +317,13 @@ signature rule set covering, among others:
 Specific signatures always beat generic ones (priority ordering), so a
 cancellation line never masks the real dependency error underneath it.
 
-| Output | Contents |
+| Output (per org unless noted) | Contents |
 |:--|:--|
-| `sast-summary.md` | Findings grouped by cause with run link, branch, timestamp, failing job, runner, pipeline progress, evidence line, and the concrete remediation. Cleanup failures are real failures but not scan blockers, so they sit in a "Secondary issues" section at the bottom and never mask the primary SAST cause. |
-| `sast-findings.csv` / `.json` | Full field set per run, including stage statuses, runner fields, and log paths. |
-| `config-files/<org>/` | Each org's `veracode.yml` and `repo-list.yml` (or the `--config-file` list) fetched from the workflow repo root, one folder per org. Cross-reference `default:runs_on` and thresholds against the failures in the same report. |
+| `index.md` (root) | Fleet index: runs, primary failure count, top cause, and a link per org. |
+| `orgs/<org>/sast-summary.md` | That org's findings grouped by cause with run link, branch, timestamp, failing job, runner, pipeline progress, evidence line, and the concrete remediation. Cleanup failures sit in a "Secondary issues" section at the bottom and never mask the primary SAST cause. |
+| `orgs/<org>/sast-findings.csv` / `.json` | Full field set per run, including stage statuses, runner fields, and log paths. |
+| `orgs/<org>/logs/` | Raw discovery and per-run logs for that org, so classifications are auditable in place. |
+| `config-files/<org>/` | Each org's `veracode.yml` and `repo-list.yml` (or the `--config-file` list) fetched from the workflow repo root. Cross-reference `default:runs_on` and thresholds against the failures in the same run folder. |
 
 ```bash
 python helpers/bulk-sast-analyzer.py                         # all reachable orgs
@@ -326,9 +350,11 @@ is split accordingly.
 | Secondary issues | Cleanup failures and non-actionable, passed, or collection-limited runs. |
 
 It fetches the complete run log (no `--relevant-only`; SCA job names do not
-match the SAST pipeline patterns) and writes `sca-summary.md`,
-`sca-findings.csv`, and `sca-findings.json` with the same layout conventions
-as the SAST helper, plus the same `config-files/<org>/` folder. That puts the
+match the SAST pipeline patterns) and writes the same per-org layout as the
+SAST helper: a fleet `index.md` (with operational and gate failure counts per
+org) plus `orgs/<org>/` folders containing `sca-summary.md`,
+`sca-findings.csv`, `sca-findings.json`, and the raw logs, alongside
+`config-files/<org>/`. That puts the
 resolved gate threshold from the logs and the configured
 `break_build_severity_threshold` from `veracode.yml` side by side in one
 output folder.
