@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import datetime as dt
 import json
 import re
@@ -815,12 +816,13 @@ def is_reportable(row: Finding, include_ok: bool) -> bool:
     return not (row.result == "SAST_NO_FAILURE_OBSERVED" and not row.cleanup_code)
 
 
-def write_markdown(directory: Path, rows: list[Finding]) -> None:
+def write_markdown(directory: Path, rows: list[Finding], scope: str = "") -> None:
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     primary_rows = [r for r in rows if r.result in PRIMARY_RESULTS]
     secondary_rows = [r for r in rows if r.result not in PRIMARY_RESULTS]
+    title = f"# Veracode SAST triage: {scope}" if scope else "# Bulk Veracode SAST triage"
     lines = [
-        "# Bulk Veracode SAST triage",
+        title,
         "",
         f"Generated: {generated}",
         f"Runs analyzed: {len(rows)}",
@@ -917,16 +919,53 @@ def write_markdown(directory: Path, rows: list[Finding]) -> None:
     (directory / "sast-summary.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def write_reports(directory: Path, findings: list[Finding], include_ok: bool) -> None:
-    reportable = [row for row in findings if is_reportable(row, include_ok)]
+def write_org_reports(org_dir: Path, organization: str, rows: list[Finding]) -> None:
+    org_dir.mkdir(parents=True, exist_ok=True)
     fields = list(Finding.__dataclass_fields__)
-    with (directory / "sast-findings.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+    with (org_dir / "sast-findings.csv").open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(asdict(row) for row in reportable)
-    (directory / "sast-findings.json").write_text(
-        json.dumps([asdict(row) for row in reportable], indent=2), encoding="utf-8")
-    write_markdown(directory, reportable)
+        writer.writerows(asdict(row) for row in rows)
+    (org_dir / "sast-findings.json").write_text(
+        json.dumps([asdict(row) for row in rows], indent=2), encoding="utf-8")
+    write_markdown(org_dir, rows, scope=organization)
+
+
+def write_index(directory: Path, by_org: dict[str, list[Finding]]) -> None:
+    """Fleet index: one row per org with counts and a link to its report."""
+    generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "# Veracode SAST triage index",
+        "",
+        f"Generated: {generated}",
+        f"Organizations: {len(by_org)}",
+        "",
+        "| Org | Runs | Primary failures | Top cause | Report |",
+        "|:--|:--|:--|:--|:--|",
+    ]
+    for organization in sorted(by_org):
+        rows = by_org[organization]
+        primary = [r for r in rows if r.result in PRIMARY_RESULTS]
+        cause_counts: dict[str, int] = {}
+        for row in primary:
+            cause_counts[row.primary_code] = cause_counts.get(row.primary_code, 0) + 1
+        top_cause = max(cause_counts.items(), key=lambda item: item[1])[0] if cause_counts else "none"
+        folder = safe_target_name(organization)
+        lines.append(f"| {organization} | {len(rows)} | {len(primary)} | `{top_cause}` "
+                     f"| [sast-summary.md](orgs/{folder}/sast-summary.md) |")
+    lines.append("")
+    (directory / "index.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_reports(directory: Path, findings: list[Finding], include_ok: bool) -> None:
+    """Write per-org report folders plus a fleet index, never one big report."""
+    reportable = [row for row in findings if is_reportable(row, include_ok)]
+    by_org: dict[str, list[Finding]] = {}
+    for row in reportable:
+        by_org.setdefault(row.organization, []).append(row)
+    for organization, rows in sorted(by_org.items()):
+        write_org_reports(directory / "orgs" / safe_target_name(organization), organization, rows)
+    write_index(directory, by_org)
 
 
 def infer_filename(path: Path) -> tuple[str, str]:
@@ -1034,9 +1073,11 @@ def main() -> int:
         for workflow_repo in dict.fromkeys(workflow_repositories):
             organization = workflow_repo.split("/", 1)[0]
             target_name = safe_target_name(workflow_repo)
+            logs_dir = result_dir / "orgs" / safe_target_name(organization) / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
             if args.fetch_configs:
                 fetch_config_files(args, result_dir, workflow_repo, fetched_config_orgs)
-            discovery_file = result_dir / f"{target_name}-sast-discovery.log"
+            discovery_file = logs_dir / f"{target_name}-sast-discovery.log"
             discovery = [args.python_executable, str(args.cli),
                          "workflows", "--repo", workflow_repo, "--limit", str(args.limit),
                          "--name", SAST_WORKFLOW_NAME, "--name-break", "--csv"]
@@ -1052,8 +1093,8 @@ def main() -> int:
                 continue
             for run_meta in extract_runs(output, args.runs_per_repo):
                 run_id = run_meta.run_id
-                log = result_dir / f"{target_name}-sast-{run_id}.log"
-                manifest = result_dir / f"{target_name}-sast-{run_id}-jobs.json"
+                log = logs_dir / f"{target_name}-sast-{run_id}.log"
+                manifest = logs_dir / f"{target_name}-sast-{run_id}-jobs.json"
                 command = [args.python_executable, str(args.cli),
                            "logs", "--repo", workflow_repo, "--run-id", run_id,
                            "--relevant-only", "--manifest", str(manifest)]
@@ -1071,9 +1112,8 @@ def main() -> int:
     print(f"\nAnalyzed: {len(findings)}")
     if config_root.is_dir():
         print(f"Configs:  {config_root}")
-    print(f"Summary:  {result_dir / 'sast-summary.md'}")
-    print(f"CSV:      {result_dir / 'sast-findings.csv'}")
-    print(f"JSON:     {result_dir / 'sast-findings.json'}")
+    print(f"Index:    {result_dir / 'index.md'}")
+    print(f"Per-org:  {result_dir / 'orgs'}{os.sep}<org>{os.sep}sast-summary.md (.csv, .json)")
     return 1 if operational_failures else 0
 
 
