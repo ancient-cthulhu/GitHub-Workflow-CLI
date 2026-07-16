@@ -177,6 +177,65 @@ GATE_PASS_PATTERNS = (
 )
 
 
+
+@dataclass
+class RunnerInfo:
+    runner_image: str = ""
+    runner_os: str = ""
+    runner_name: str = ""
+    runner_type: str = "unknown"
+
+
+def detect_runner(text: str) -> RunnerInfo:
+    """Detect the runner each job ran on from the Set up job block.
+
+    GitHub-hosted runners print a Runner Image block (Image: ubuntu-24.04,
+    windows-2022, macos-14, ...). Note this is the resolved image, not the
+    literal runs_on label: windows-latest shows up as its current image.
+    Self-hosted runners print Runner name / Machine name instead.
+    """
+    info = RunnerInfo()
+    images: list[str] = []
+    os_line = ""
+    for raw in text.splitlines():
+        content = line_content(raw).strip()
+        match = re.match(r"^Image:\s*([A-Za-z0-9._-]+)\s*$", content)
+        if match and match.group(1) not in images:
+            images.append(match.group(1))
+            continue
+        if not os_line:
+            match = re.match(r"^(Ubuntu|Microsoft Windows.*|Windows Server.*|macOS.*)\s*$", content)
+            if match:
+                os_line = match.group(1)
+        if not info.runner_name:
+            match = re.search(r"Runner name:\s*'([^']+)'", content)
+            if match:
+                info.runner_name = match.group(1)
+    info.runner_image = ";".join(images)
+    first_image = images[0].lower() if images else ""
+    if first_image.startswith("ubuntu"):
+        info.runner_os = "linux"
+    elif first_image.startswith("windows"):
+        info.runner_os = "windows"
+    elif first_image.startswith("macos"):
+        info.runner_os = "macos"
+    elif os_line:
+        lowered = os_line.lower()
+        info.runner_os = ("windows" if "windows" in lowered
+                          else "macos" if "macos" in lowered
+                          else "linux" if "ubuntu" in lowered else "")
+    if re.search(r"Hosted Compute Agent|Runner Image Provisioner", text):
+        info.runner_type = "github-hosted"
+    elif info.runner_name:
+        info.runner_type = "self-hosted"
+    return info
+
+
+def runner_display(row) -> str:
+    label = row.runner_image or row.runner_name or "unknown"
+    return f"{label} ({row.runner_type})" if row.runner_type != "unknown" else label
+
+
 @dataclass
 class RunMeta:
     run_id: str
@@ -217,6 +276,10 @@ class Finding:
     branch: str
     created_at: str
     conclusion: str
+    runner_image: str
+    runner_os: str
+    runner_name: str
+    runner_type: str
     result: str
     failure_stage: str
     primary_code: str
@@ -527,6 +590,7 @@ def classify(path: Path, organization: str, workflow_repo: str, run_meta: RunMet
     cleanup_text = select_job_lines(text, cleanup_jobs) if cleanup_jobs else ""
     cleanup_code, cleanup_evidence = classify_cleanup(cleanup_text, text)
     metrics = extract_metrics(text)
+    runner = detect_runner(text)
 
     matches = [(rule, matching_line(text, rule.patterns)) for rule in RULES
                if any(re.search(pattern, text, re.I | re.M) for pattern in rule.patterns)]
@@ -584,6 +648,10 @@ def classify(path: Path, organization: str, workflow_repo: str, run_meta: RunMet
         branch=run_meta.branch,
         created_at=run_meta.created_at,
         conclusion=run_meta.conclusion,
+        runner_image=runner.runner_image,
+        runner_os=runner.runner_os,
+        runner_name=runner.runner_name,
+        runner_type=runner.runner_type,
         result=result,
         failure_stage=primary.stage,
         primary_code=primary.code,
@@ -662,6 +730,14 @@ def write_markdown(directory: Path, rows: list[Finding]) -> None:
         lines.append("- No failures classified.")
     lines.append("")
 
+    runner_counts: dict[str, int] = {}
+    for row in rows:
+        runner_counts[runner_display(row)] = runner_counts.get(runner_display(row), 0) + 1
+    lines.extend(["## Runner breakdown", ""])
+    for label, count in sorted(runner_counts.items(), key=lambda item: (-item[1], item[0])):
+        lines.append(f"- **{count}** on `{label}`")
+    lines.append("")
+
     lines.extend(["## Operational failures by cause", ""])
     if not operational:
         lines.extend(["None.", ""])
@@ -685,6 +761,7 @@ def write_markdown(directory: Path, rows: list[Finding]) -> None:
                 lines.append(f"  - Source repository: `{row.source_repository}`")
             lines.append(f"  - Failed at: `{row.failure_stage}`"
                          + (f" in job `{row.failing_job}`" if row.failing_job else ""))
+            lines.append(f"  - Runner: `{runner_display(row)}`")
             lines.append(f"  - Evidence: `{row.evidence}`" if row.evidence
                          else "  - Evidence: no known signature")
             if row.all_codes and ";" in row.all_codes:
@@ -706,6 +783,7 @@ def write_markdown(directory: Path, rows: list[Finding]) -> None:
             lines.append(f"- Run: {finding_link(row)}"
                          + (f", branch `{row.branch}`" if row.branch else "")
                          + (f", {row.created_at}" if row.created_at else ""))
+            lines.append(f"- Runner: `{runner_display(row)}`")
             threshold = row.threshold or "unknown"
             lines.append(f"- Gate: **{count_or_na(row.gate_findings)}** finding(s) at or above threshold **{threshold}**")
             lines.append(f"- Severity split: critical {count_or_na(row.findings_critical)}, "
