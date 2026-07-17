@@ -417,9 +417,10 @@ def parse_args() -> argparse.Namespace:
                         help="Re-analyze previously collected logs instead of fetching")
     parser.add_argument("--include-ok", action="store_true",
                         help="Also report runs where no SAST failure was observed")
-    parser.add_argument("--fetch-configs", action=argparse.BooleanOptionalAction, default=True,
-                        help=("Also save each org's workflow config files (default: veracode.yml "
-                              "and repo_list.yml) under config-files/<org>/ in the output folder."))
+    parser.add_argument("--fetch-configs", action=argparse.BooleanOptionalAction, default=False,
+                        help=("Opt in to also save each org's workflow config files (default files: "
+                              "veracode.yml and repo-list.yml) under config-files/<org>/ in the "
+                              "output folder. Off by default."))
     parser.add_argument("--config-file", dest="config_files", action="append", metavar="NAME",
                         help=("Config file name to fetch from the workflow repo root; repeatable. "
                               "Overrides the default list when given."))
@@ -480,6 +481,36 @@ def run_capture(command: list[str], output_file: Path) -> tuple[int, str]:
         code = 127
     output_file.write_text(output, encoding="utf-8")
     return code, output
+
+def first_error_line(output: str) -> str:
+    """First line of captured output that looks like an error, for diagnostics."""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if re.search(r"(?:^Error\b|error:|HTTP \d{3}|Not Found|Unauthorized|Forbidden|"
+                     r"rate limit|Unable to run|timed out|Traceback)", stripped, re.I):
+            return stripped[:300]
+    for line in output.splitlines():
+        if line.strip():
+            return line.strip()[:300]
+    return "(no output captured)"
+
+
+def failure_hint(output: str, workflow_repo: str) -> str:
+    """Targeted next step for the most common systematic discovery failures."""
+    if re.search(r"HTTP 404|Not Found", output, re.I):
+        return (f"hint: {workflow_repo} was not found; if your central workflow repo has a "
+                f"different name, set --workflow-repo (verify with: repos --org "
+                f"{workflow_repo.split('/', 1)[0]} --csv)")
+    if re.search(r"HTTP 401|Unauthorized|Bad credentials", output, re.I):
+        return "hint: token rejected; verify GITHUB_TOKEN is exported in this shell (check with: token-info)"
+    if re.search(r"HTTP 403|Forbidden|rate limit", output, re.I):
+        return "hint: access denied or rate limited; check token scopes/SSO authorization and gh api rate_limit"
+    if re.search(r"Unable to run gh|No such file or directory: 'gh'", output, re.I):
+        return "hint: the gh CLI is not on PATH for this shell"
+    if re.search(r"timed out", output, re.I):
+        return "hint: gh timed out; retry or check network/proxy from this host"
+    return ""
+
 
 
 def extract_runs(output: str) -> list[RunMeta]:
@@ -1050,14 +1081,14 @@ def infer_filename(path: Path) -> tuple[str, str]:
 
 
 
-DEFAULT_CONFIG_FILES = ("veracode.yml", "repo_list.yml")
+DEFAULT_CONFIG_FILES = ("veracode.yml", "repo-list.yml")
 
 
 def fetch_config_files(args: argparse.Namespace, result_dir: Path,
                        workflow_repo: str, fetched_orgs: set[str]) -> None:
     """Save the org's workflow config files under config-files/<org>/.
 
-    Fetches each configured file (default: veracode.yml and repo_list.yml)
+    Fetches each configured file (default: veracode.yml and repo-list.yml)
     from the root of the central workflow repository. Missing files are
     normal in some orgs and only produce a note, never a failure.
     """
@@ -1164,7 +1195,12 @@ def main() -> int:
             code, output = run_capture(discovery, discovery_file)
             if code != 0:
                 operational_failures += 1
-                print(f"WARNING: discovery failed for {workflow_repo}", file=sys.stderr)
+                print(f"WARNING: discovery failed for {workflow_repo} (exit {code}): "
+                      f"{first_error_line(output)}", file=sys.stderr)
+                hint = failure_hint(output, workflow_repo)
+                if hint:
+                    print(f"  {hint}", file=sys.stderr)
+                print(f"  full output: {discovery_file}", file=sys.stderr)
                 if args.fail_fast:
                     break
                 continue
@@ -1190,9 +1226,11 @@ def main() -> int:
                            "logs", "--repo", workflow_repo, "--run-id", run_id,
                            "--relevant-only", "--manifest", str(manifest)]
                 print(f"Fetching build and scan steps: {workflow_repo} run {run_id}")
-                log_code, _ = run_capture(command, log)
+                log_code, log_output = run_capture(command, log)
                 if log_code != 0:
                     operational_failures += 1
+                    print(f"WARNING: log fetch failed for {workflow_repo} run {run_id} "
+                          f"(exit {log_code}): {first_error_line(log_output)}", file=sys.stderr)
                 findings.append(classify(log, organization, workflow_repo, run_meta,
                                          manifest if manifest.is_file() else None, log_code))
                 if log_code != 0 and args.fail_fast:
