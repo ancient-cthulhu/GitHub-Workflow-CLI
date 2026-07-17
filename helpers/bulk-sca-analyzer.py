@@ -342,6 +342,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--failed-only", action=argparse.BooleanOptionalAction, default=True,
                         help=("Only analyze failed/cancelled/timed-out runs (default: on). "
                               "Gate failures mark the run as failed, so they are included."))
+    parser.add_argument("--last", type=positive_int, metavar="N",
+                        help=("Troubleshoot mode: analyze the newest N runs "
+                              "chronologically, success or failure alike. "
+                              "Shorthand for --no-failed-only --include-ok "
+                              "--max-age-days 0 --runs-per-repo N with strict "
+                              "newest-first selection (no per-target dedup)."))
     parser.add_argument("--cli", type=Path, default=Path("github-workflow-cli.py"),
                         help="Path to the GitHub Workflow CLI")
     parser.add_argument("--python", dest="python_executable", default=sys.executable)
@@ -527,7 +533,8 @@ def run_sort_key(run: RunMeta):
     return (-created_key, -id_key)
 
 
-def select_runs(runs: list[RunMeta], maximum: int, max_age_days: int) -> tuple[list[RunMeta], int, int]:
+def select_runs(runs: list[RunMeta], maximum: int, max_age_days: int,
+                newest_overall: bool = False) -> tuple[list[RunMeta], int, int]:
     """Pick the most recent, most actionable runs.
 
     This is the freshness core of the helper, deliberately defensive:
@@ -556,6 +563,9 @@ def select_runs(runs: list[RunMeta], maximum: int, max_age_days: int) -> tuple[l
     skipped_by_age = matched - len(runs)
 
     ordered = sorted(runs, key=run_sort_key)
+    if newest_overall:
+        # --last mode: literal newest N runs, older ones become fallback.
+        return ordered[:maximum], ordered[maximum:], matched, skipped_by_age
     selected: list[RunMeta] = []
     chosen_ids: set[str] = set()
     seen_names: set[str] = set()
@@ -1101,6 +1111,12 @@ def discover_organizations(args: argparse.Namespace, result_dir: Path) -> list[s
 
 def main() -> int:
     args = parse_args()
+    if args.last:
+        # One flag, one intent: recent runs regardless of outcome.
+        args.failed_only = False
+        args.include_ok = True
+        args.max_age_days = 0
+        args.runs_per_repo = args.last
     result_dir = args.output_dir / f"sca-bulk-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
     result_dir.mkdir(parents=True, exist_ok=True)
     findings: list[Finding] = []
@@ -1170,8 +1186,18 @@ def main() -> int:
                     break
                 continue
             matched_runs = extract_runs(output)
+            if matched_runs:
+                by_conclusion: dict[str, int] = {}
+                for run in matched_runs:
+                    key = run.conclusion or "in_progress"
+                    by_conclusion[key] = by_conclusion.get(key, 0) + 1
+                breakdown = ", ".join(
+                    f"{count} {name}" for name, count in
+                    sorted(by_conclusion.items(), key=lambda kv: (-kv[1], kv[0])))
+                print(f"Discovery: {len(matched_runs)} run(s): {breakdown}")
             selected_runs, fallback_runs, matched, skipped_by_age = select_runs(
-                matched_runs, args.runs_per_repo, args.max_age_days)
+                matched_runs, args.runs_per_repo, args.max_age_days,
+                newest_overall=bool(args.last))
             if not matched:
                 print(f"NOTE: no matching runs in the newest {args.limit} runs of "
                       f"{workflow_repo}; if failures are older, raise --limit")
@@ -1179,8 +1205,10 @@ def main() -> int:
                 print(f"NOTE: {matched} matching run(s) in {workflow_repo} but all older "
                       f"than {args.max_age_days} days; raise --max-age-days to include them")
             else:
+                order_note = ("newest first" if args.last
+                              else "newest per scan target first")
                 print(f"Runs: matched {matched}, selected {len(selected_runs)} "
-                      f"(newest per scan target first)"
+                      f"({order_note})"
                       + (f", skipped {skipped_by_age} older than {args.max_age_days}d"
                          if skipped_by_age else ""))
             # Candidates beyond the selection serve as fallback when a selected
