@@ -275,6 +275,8 @@ class RunnerInfo:
     runner_os: str = ""
     runner_name: str = ""
     runner_type: str = "unknown"
+    runner_group: str = ""
+    requested_labels: str = ""
 
 
 def detect_runner(text: str) -> RunnerInfo:
@@ -302,6 +304,14 @@ def detect_runner(text: str) -> RunnerInfo:
             match = re.search(r"Runner name:\s*'([^']+)'", content)
             if match:
                 info.runner_name = match.group(1)
+        if not info.runner_group:
+            match = re.search(r"Runner group name:\s*'([^']+)'", content)
+            if match:
+                info.runner_group = match.group(1)
+        if not info.requested_labels:
+            match = re.search(r"Requested labels:\s*(.+)$", content)
+            if match:
+                info.requested_labels = match.group(1).strip()
     info.runner_image = ";".join(images)
     first_image = images[0].lower() if images else ""
     if first_image.startswith("ubuntu"):
@@ -350,6 +360,8 @@ class Finding:
     runner_os: str
     runner_name: str
     runner_type: str
+    runner_group: str
+    requested_labels: str
     result: str
     failure_stage: str
     primary_code: str
@@ -913,6 +925,8 @@ def classify(path: Path, organization: str, workflow_repo: str, run_meta: RunMet
         runner_os=runner.runner_os,
         runner_name=runner.runner_name,
         runner_type=runner.runner_type,
+        runner_group=runner.runner_group,
+        requested_labels=runner.requested_labels,
         result=result,
         failure_stage=effective_stage,
         primary_code=primary.code,
@@ -1116,6 +1130,119 @@ def write_index(directory: Path, by_org: dict[str, list[Finding]]) -> None:
     (directory / "index.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def parse_config_runs_on(text: str) -> dict[str, str]:
+    """Best-effort runs_on extraction from a veracode.yml, no YAML dependency.
+
+    Handles inline (runs_on: self-hosted) and list form. Tracks the YAML path
+    by indentation so default:runs_on and actions:<scan>:build:runs_on are
+    kept apart. Tolerant of partial or slightly malformed files by design.
+    """
+    results = {"default": "", "build_static": "", "build_sca": ""}
+    lines = text.splitlines()
+    stack: list[tuple[int, str]] = []
+    for index, raw in enumerate(lines):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("- "):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        match = re.match(r"([A-Za-z_][\w-]*):\s*(.*)$", stripped)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2).strip()
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        path = [name for _, name in stack] + [key]
+        if key == "runs_on":
+            labels = value
+            if not labels:
+                items = []
+                for follow in lines[index + 1:]:
+                    follow_stripped = follow.strip()
+                    follow_indent = len(follow) - len(follow.lstrip())
+                    if follow_stripped.startswith("- ") and follow_indent > indent:
+                        items.append(follow_stripped[2:].strip().strip("'\""))
+                    elif follow_stripped and not follow_stripped.startswith("#"):
+                        break
+                labels = ", ".join(items)
+            labels = labels.strip().strip("'\"")
+            if path[0] == "default":
+                results["default"] = labels
+            elif "actions" in path and "build" in path:
+                if "veracode_static_scan" in path:
+                    results["build_static"] = labels
+                elif "veracode_sca_scan" in path:
+                    results["build_sca"] = labels
+        stack.append((indent, key))
+    return results
+
+
+
+def lint_runs_on(text: str) -> tuple[str, list[str]]:
+    """Parse default:runs_on and flag the config mistakes that silently
+    disable it. Returns (parsed default value, warnings)."""
+    warnings: list[str] = []
+    if re.search(r"^\s*runs-on\s*:", text, re.M):
+        warnings.append("found 'runs-on:' (hyphen); the integration key is runs_on")
+    if re.search(r"^\s*default_runs_on\s*:", text, re.M):
+        warnings.append("found 'default_runs_on:'; the shape is 'default:' with nested 'runs_on:'")
+    if "\t" in text:
+        warnings.append("file contains tab characters; YAML indentation must be spaces")
+    parsed = parse_config_runs_on(text)
+    if not parsed["default"] and re.search(r"^\s+runs_on\s*:", text, re.M):
+        warnings.append("runs_on exists but not under top-level 'default:'; "
+                        "it is ignored for the default runner")
+    return parsed["default"], warnings
+
+
+def fetch_run_jobs(args: argparse.Namespace, workflow_repo: str, run_id: str) -> dict:
+    """Requested labels and resolved runner per job via the CLI 'jobs' command.
+
+    The labels are exactly what the Veracode dispatch payload put into
+    runs-on; jobs metadata outlives log retention, so this works even for
+    LOGS_UNAVAILABLE runs.
+    """
+    command = [args.python_executable, str(args.cli), "jobs",
+               "--repo", workflow_repo, "--run-id", run_id]
+    info: dict = {"labels": set(), "runner_names": set(),
+                  "runner_groups": set(), "hosted": None}
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=300, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return info
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return info
+    hosted_votes = []
+    for row in csv.DictReader(completed.stdout.splitlines()):
+        labels = (row.get("labels") or "").strip()
+        if labels:
+            info["labels"].add(labels)
+        name = (row.get("runner_name") or "").strip()
+        group = (row.get("runner_group") or "").strip()
+        if name:
+            info["runner_names"].add(name)
+        if group:
+            info["runner_groups"].add(group)
+            hosted_votes.append(group == "GitHub Actions")
+    if hosted_votes:
+        info["hosted"] = all(hosted_votes)
+    return info
+
+
+def apply_jobs_info(finding, info: dict) -> None:
+    """Prefer API-sourced runner facts over log scraping on the finding."""
+    if info["labels"]:
+        finding.requested_labels = " | ".join(sorted(info["labels"]))
+    if info["runner_groups"]:
+        finding.runner_group = ";".join(sorted(info["runner_groups"]))
+    if info["hosted"] is True:
+        finding.runner_type = "github-hosted"
+    elif info["hosted"] is False:
+        finding.runner_type = "self-hosted"
+        if info["runner_names"]:
+            finding.runner_name = ";".join(sorted(info["runner_names"]))
+
+
 def write_reports(directory: Path, findings: list[Finding], include_ok: bool) -> None:
     """Write per-org report folders plus a fleet index, never one big report."""
     reportable = [row for row in findings if is_reportable(row, include_ok)]
@@ -1295,6 +1422,9 @@ def main() -> int:
             fetched = 0
             attempts = 0
             expired_runs = 0
+            runs_hosted = 0
+            runs_selfhosted = 0
+            payload_labels: set[str] = set()
             stop = False
             for run_meta in candidates:
                 if fetched >= args.runs_per_repo or attempts >= attempts_budget:
@@ -1308,6 +1438,14 @@ def main() -> int:
                            "--relevant-only", "--manifest", str(manifest)]
                 print(f"Fetching build and scan steps: {workflow_repo} run {run_id}")
                 log_code, log_output = run_capture(command, log)
+                jobs_info = fetch_run_jobs(args, workflow_repo, run_id)
+                if jobs_info["labels"]:
+                    payload_labels.update(jobs_info["labels"])
+                    if any("self-hosted" in label
+                           for label in jobs_info["labels"]):
+                        runs_selfhosted += 1
+                    else:
+                        runs_hosted += 1
                 category = ("OK" if log_code == 0
                             else log_failure_category(log_code, log_output))
                 if category == "IN_PROGRESS":
@@ -1329,6 +1467,7 @@ def main() -> int:
                     finding.recommendation = ("Logs are gone from GitHub; lower --max-age-days "
                                               "toward the org's Actions log retention window, "
                                               "or re-trigger the scan for fresh logs.")
+                    apply_jobs_info(finding, jobs_info)
                     findings.append(finding)
                     continue
                 if log_code != 0:
@@ -1349,16 +1488,49 @@ def main() -> int:
                         # of this repo instead of burning the attempts budget.
                         print(f"  aborting remaining fetches for {workflow_repo}: "
                               f"auth failures repeat", file=sys.stderr)
-                        findings.append(classify(log, organization, workflow_repo,
-                                                 run_meta, None, log_code))
+                        finding = classify(log, organization, workflow_repo,
+                                           run_meta, None, log_code)
+                        apply_jobs_info(finding, jobs_info)
+                        findings.append(finding)
                         break
                 else:
                     fetched += 1
-                findings.append(classify(log, organization, workflow_repo, run_meta,
-                                         manifest if manifest.is_file() else None, log_code))
+                finding = classify(log, organization, workflow_repo, run_meta,
+                                   manifest if manifest.is_file() else None, log_code)
+                apply_jobs_info(finding, jobs_info)
+                findings.append(finding)
                 if log_code != 0 and args.fail_fast:
                     stop = True
                     break
+            total_checked = runs_hosted + runs_selfhosted
+            if total_checked:
+                print(f"RUNNER CHECK {workflow_repo}: {runs_selfhosted}/{total_checked} "
+                      f"run(s) requested self-hosted labels; payload labels seen: "
+                      f"{sorted(payload_labels)}")
+                config = (result_dir / "config-files"
+                          / safe_target_name(organization) / "veracode.yml")
+                if config.is_file():
+                    default_value, lint_warnings = lint_runs_on(
+                        config.read_text(encoding="utf-8", errors="replace"))
+                    print(f"  CONFIG: default:runs_on parses as "
+                          f"{default_value or '(not set)'}")
+                    for warning in lint_warnings:
+                        print(f"  CONFIG LINT: {warning}")
+                    wants_self = "self-hosted" in default_value.lower()
+                    if wants_self and runs_hosted == total_checked:
+                        print("  => PROOF: config asks for self-hosted but no dispatch "
+                              "payload contained self-hosted labels. The app reads "
+                              "veracode.yml from the veracode repo's DEFAULT branch at "
+                              "dispatch time. Verify: (1) the repo's default branch is "
+                              "the branch you edited, (2) the file is veracode.yml at "
+                              "the repo root, (3) then push a fresh commit to a scanned "
+                              "repo and re-check its newest run's labels.")
+                    elif not wants_self and not lint_warnings:
+                        print("  => fetched config does not request self-hosted; fix "
+                              "this org's veracode.yml")
+                else:
+                    print("  (run with --fetch-configs to cross-check this org's "
+                          "veracode.yml against the payload labels)")
             if expired_runs:
                 print(f"NOTE: {expired_runs} run(s) in {workflow_repo} had expired logs "
                       f"(Actions retention); fell back to older candidates, "
