@@ -378,8 +378,6 @@ class Finding:
     policy_scan_status: str
     all_codes: str
     failing_job: str
-    queue_seconds: str = ""
-    jobs_duration_seconds: str = ""
     evidence: str
     missing_package: str
     actionable_sast: bool
@@ -391,6 +389,8 @@ class Finding:
     log_file: str
     manifest_file: str
     collection_exit_code: int
+    queue_seconds: str = ""
+    jobs_duration_seconds: str = ""
 
 
 def positive_int(value: str) -> int:

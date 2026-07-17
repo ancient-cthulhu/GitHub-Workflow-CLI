@@ -317,14 +317,14 @@ class Finding:
     update_advisor: str
     all_codes: str
     failing_job: str
-    queue_seconds: str = ""
-    jobs_duration_seconds: str = ""
     evidence: str
     cleanup_status: str
     cleanup_code: str
     cleanup_evidence: str
     log_file: str
     collection_exit_code: int
+    queue_seconds: str = ""
+    jobs_duration_seconds: str = ""
 
 
 def positive_int(value: str) -> int:
