@@ -14,7 +14,9 @@ import csv
 import io
 import json
 import os
+import random
 import re
+import time
 from pathlib import Path
 import signal
 import subprocess
@@ -533,31 +535,92 @@ SAST_EXCLUDED_JOB_PATTERNS = (
 )
 
 
-def run_gh_log_command(cmd: list[str], env: dict[str, str]) -> str:
-    """Run gh, preserve the complete byte stream, and decode as UTF-8 safely."""
-    try:
-        result = subprocess.run(
-            cmd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=SUBPROCESS_TIMEOUT,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"gh command timed out after {SUBPROCESS_TIMEOUT} seconds"
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(f"Unable to run gh: {exc}") from exc
+# Log-fetch failure categories, mapped to distinct process exit codes by
+# cmd_logs so bulk callers can branch without parsing prose.
+LOG_ERROR_EXIT_CODES = {
+    "GONE": 4,          # HTTP 410 / log not found: permanent, use another run
+    "IN_PROGRESS": 5,   # run not finished yet: skip, do not count as failure
+    "TRANSIENT": 6,     # 5xx / network / timeout: retries exhausted
+    "AUTH": 7,          # 401/403: fix token, retrying is pointless
+    "NOT_FOUND": 8,     # 404: bad repo or run id
+}
 
-    stdout = result.stdout.decode("utf-8-sig", errors="replace")
-    stderr = result.stderr.decode("utf-8-sig", errors="replace")
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gh command failed with code {result.returncode}: {stderr.strip()}"
-        )
-    return stdout
+
+class GhLogError(RuntimeError):
+    """gh log fetch failure with a machine-usable category."""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
+
+
+def classify_gh_log_error(stderr: str) -> str:
+    """Map gh stderr to a failure category. Order matters: most specific first."""
+    if re.search(r"HTTP 410|\blog not found\b|\bGone\b", stderr, re.I):
+        return "GONE"
+    if re.search(r"still in progress|has not (?:yet )?completed", stderr, re.I):
+        return "IN_PROGRESS"
+    if re.search(r"HTTP 40[13]|Unauthorized|Forbidden|Bad credentials|"
+                 r"rate limit", stderr, re.I):
+        return "AUTH"
+    if re.search(r"HTTP 404|Not Found", stderr, re.I):
+        return "NOT_FOUND"
+    # 5xx from the logs endpoint, blob fetch failures from
+    # results-receiver.actions.githubusercontent.com, connection resets, and
+    # gh's "more than 25 job logs missing" fallback error are all transient.
+    if re.search(r"HTTP 5\d\d|failed to get run log|connection (?:reset|refused)|"
+                 r"timed? ?out|TLS|EOF|temporary failure|missing.*job logs",
+                 stderr, re.I):
+        return "TRANSIENT"
+    return "UNKNOWN"
+
+
+def run_gh_log_command(
+    cmd: list[str],
+    env: dict[str, str],
+    max_attempts: int = 3,
+    backoff_base: float = 2.0,
+) -> str:
+    """Run gh with bounded retry on transient failures only.
+
+    Permanent conditions (410 Gone, auth, 404, run in progress) fail
+    immediately with a category so callers can pick the right fallback.
+    """
+    last_error = "unknown failure"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = subprocess.run(
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=SUBPROCESS_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            category, last_error = "TRANSIENT", (
+                f"gh command timed out after {SUBPROCESS_TIMEOUT} seconds"
+            )
+        except OSError as exc:
+            raise GhLogError("UNKNOWN", f"Unable to run gh: {exc}") from exc
+        else:
+            if result.returncode == 0:
+                return result.stdout.decode("utf-8-sig", errors="replace")
+            stderr = result.stderr.decode("utf-8-sig", errors="replace").strip()
+            category = classify_gh_log_error(stderr)
+            last_error = (
+                f"gh command failed with code {result.returncode}: {stderr}"
+            )
+        if category != "TRANSIENT":
+            raise GhLogError(category, last_error)
+        if attempt < max_attempts:
+            delay = backoff_base ** attempt + random.uniform(0, 1)
+            print(f"Transient log fetch failure (attempt {attempt}/{max_attempts}), "
+                  f"retrying in {delay:.1f}s: {last_error[:200]}", file=sys.stderr)
+            time.sleep(delay)
+    raise GhLogError(
+        "TRANSIENT", f"{last_error} (after {max_attempts} attempts)"
+    )
 
 
 def workflow_log_job_name(line: str) -> str:
@@ -689,6 +752,10 @@ def cmd_logs(
                 encoding="utf-8",
             )
         return 0
+    except GhLogError as exc:
+        # Structured marker plus category exit code; bulk helpers key on both.
+        print(f"Error[{exc.category}]: {exc}", file=sys.stderr)
+        return LOG_ERROR_EXIT_CODES.get(exc.category, 1)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
