@@ -245,7 +245,7 @@ discovery query per org.
 | `--targets FILE` | auto-discover | One target per line, `org` or `org/repo`; `#` comments allowed. A bare `org` maps to `<org>/<workflow-repo>`. Without the flag, every org the token reaches is discovered via `orgs --csv`. |
 | `--workflow-repo NAME` (alias `--repo`) | `veracode` | Central workflow repository name inside each org. Also labels logs re-analyzed with `--analyze-dir`. |
 | `--limit N` | 200 | Workflow runs listed per repository during discovery, newest first. The central repo's run list is shared by all Veracode workflows, so keep this comfortably larger than `--runs-per-repo`. |
-| `--last N` | | Sets `--no-failed-only` `--include-ok` `--max-age-days` 0 `--runs-per-repo` N in one shot. |
+| `--last N` | | Sets `--no-failed-only` `--include-ok` `--max-age-days 0` `--runs-per-repo N` in one shot. |
 | `--runs-per-repo N` | 10 | Runs whose logs are fetched and classified, per repository, chosen by the selection policy below. |
 | `--max-age-days N` | 30 | Ignore matched runs older than this (0 disables). Keeps triage on current, re-triggerable failures instead of stale history. Runs with a missing timestamp are kept, never silently dropped. |
 | `--failed-only` / `--no-failed-only` | on | Restrict discovery to `failure,cancelled,timed_out,action_required,startup_failure,stale`. `startup_failure` catches invalid workflow files that never start a job. Gate failures mark the run failed, so they are always included. |
