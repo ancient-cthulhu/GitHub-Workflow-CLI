@@ -352,7 +352,7 @@ def parse_args() -> argparse.Namespace:
                         help="Also report runs that passed the gate cleanly")
     parser.add_argument("--fetch-configs", action=argparse.BooleanOptionalAction, default=False,
                         help=("Opt in to also save each org's workflow config files (default files: "
-                              "veracode.yml and repo_list.yml) under config-files/<org>/ in the "
+                              "veracode.yml and repo-list.yml) under config-files/<org>/ in the "
                               "output folder. Off by default."))
     parser.add_argument("--config-file", dest="config_files", action="append", metavar="NAME",
                         help=("Config file name to fetch from the workflow repo root; repeatable. "
@@ -439,7 +439,21 @@ def failure_hint(output: str, workflow_repo: str) -> str:
         return "hint: the gh CLI is not on PATH for this shell"
     if re.search(r"timed out", output, re.I):
         return "hint: gh timed out; retry or check network/proxy from this host"
+    if re.search(r"log not found|HTTP 410", output, re.I):
+        return ("hint: run logs expired or were deleted (Actions log retention); "
+                "the helper falls back to newer candidates automatically")
     return ""
+
+def logs_unavailable(output: str) -> bool:
+    """True when the failure is expired/deleted run logs, not a real error.
+
+    GitHub deletes run logs after the org's Actions retention window; gh then
+    reports "log not found" (API: HTTP 410 Gone). This is a data-availability
+    condition, not a tooling failure, and gets fallback handling.
+    """
+    return bool(re.search(r"log not found|HTTP 410|\bGone\b|logs?(?: have)? expired",
+                          output, re.I))
+
 
 
 
@@ -503,7 +517,7 @@ def select_runs(runs: list[RunMeta], maximum: int, max_age_days: int) -> tuple[l
     4. Backfill pass: remaining quota filled with the next-newest runs overall
        (recent failure history for flapping targets).
 
-    Returns (selected, matched_count, skipped_by_age).
+    Returns (selected, fallback_pool, matched_count, skipped_by_age).
     """
     matched = len(runs)
     if max_age_days > 0:
@@ -536,7 +550,10 @@ def select_runs(runs: list[RunMeta], maximum: int, max_age_days: int) -> tuple[l
             selected.append(run)
             chosen_ids.add(run.run_id)
     selected.sort(key=run_sort_key)
-    return selected, matched, skipped_by_age
+    # Fallback pool: remaining fresh runs, newest first, used when a selected
+    # run's logs turn out to be expired so the quota still yields real logs.
+    fallback = [run for run in ordered if run.run_id not in chosen_ids]
+    return selected, fallback, matched, skipped_by_age
 
 
 def line_job_name(line: str) -> str:
@@ -1009,14 +1026,14 @@ def infer_filename(path: Path) -> tuple[str, str]:
 
 
 
-DEFAULT_CONFIG_FILES = ("veracode.yml", "repo_list.yml")
+DEFAULT_CONFIG_FILES = ("veracode.yml", "repo-list.yml")
 
 
 def fetch_config_files(args: argparse.Namespace, result_dir: Path,
                        workflow_repo: str, fetched_orgs: set[str]) -> None:
     """Save the org's workflow config files under config-files/<org>/.
 
-    Fetches each configured file (default: veracode.yml and repo_list.yml)
+    Fetches each configured file (default: veracode.yml and repo-list.yml)
     from the root of the central workflow repository. Missing files are
     normal in some orgs and only produce a note, never a failure.
     """
@@ -1128,7 +1145,7 @@ def main() -> int:
                     break
                 continue
             matched_runs = extract_runs(output)
-            selected_runs, matched, skipped_by_age = select_runs(
+            selected_runs, fallback_runs, matched, skipped_by_age = select_runs(
                 matched_runs, args.runs_per_repo, args.max_age_days)
             if not matched:
                 print(f"NOTE: no matching runs in the newest {args.limit} runs of "
@@ -1141,7 +1158,18 @@ def main() -> int:
                       f"(newest per scan target first)"
                       + (f", skipped {skipped_by_age} older than {args.max_age_days}d"
                          if skipped_by_age else ""))
-            for run_meta in selected_runs:
+            # Candidates beyond the selection serve as fallback when a selected
+            # run's logs are expired, so the quota still yields actionable logs.
+            candidates = selected_runs + fallback_runs
+            attempts_budget = max(args.runs_per_repo * 3, args.runs_per_repo + 5)
+            fetched = 0
+            attempts = 0
+            expired_runs = 0
+            stop = False
+            for run_meta in candidates:
+                if fetched >= args.runs_per_repo or attempts >= attempts_budget:
+                    break
+                attempts += 1
                 run_id = run_meta.run_id
                 log = logs_dir / f"{target_name}-sca-{run_id}.log"
                 # SCA jobs are not named like SAST pipeline jobs, so fetch the
@@ -1150,13 +1178,40 @@ def main() -> int:
                            "logs", "--repo", workflow_repo, "--run-id", run_id]
                 print(f"Fetching run log: {workflow_repo} run {run_id}")
                 log_code, log_output = run_capture(command, log)
+                if log_code != 0 and logs_unavailable(log_output):
+                    # Expired retention is data availability, not a tooling
+                    # failure: record it, try the next-newest candidate, and do
+                    # not flip the helper exit code for it.
+                    expired_runs += 1
+                    finding = classify(log, organization, workflow_repo, run_meta, log_code)
+                    finding.result = "LOGS_UNAVAILABLE"
+                    finding.primary_code = "LOGS_UNAVAILABLE"
+                    finding.primary_failure = "Run logs expired or deleted (Actions retention)"
+                    finding.severity = "info"
+                    finding.recommendation = ("Logs are gone from GitHub; lower --max-age-days "
+                                              "toward the org's Actions log retention window, "
+                                              "or re-trigger the scan for fresh logs.")
+                    findings.append(finding)
+                    continue
                 if log_code != 0:
                     operational_failures += 1
                     print(f"WARNING: log fetch failed for {workflow_repo} run {run_id} "
                           f"(exit {log_code}): {first_error_line(log_output)}", file=sys.stderr)
+                    hint = failure_hint(log_output, workflow_repo)
+                    if hint:
+                        print(f"  {hint}", file=sys.stderr)
+                else:
+                    fetched += 1
                 findings.append(classify(log, organization, workflow_repo, run_meta, log_code))
                 if log_code != 0 and args.fail_fast:
+                    stop = True
                     break
+            if expired_runs:
+                print(f"NOTE: {expired_runs} run(s) in {workflow_repo} had expired logs "
+                      f"(Actions retention); fell back to older candidates, "
+                      f"fetched {fetched} with logs")
+            if stop:
+                break
 
     write_reports(result_dir, findings, args.include_ok)
     config_root = result_dir / "config-files"
