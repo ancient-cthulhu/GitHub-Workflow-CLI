@@ -250,10 +250,10 @@ discovery query per org.
 | `--failed-only` / `--no-failed-only` | on | Restrict discovery to `failure,cancelled,timed_out,action_required,startup_failure,stale`. `startup_failure` catches invalid workflow files that never start a job. Gate failures mark the run failed, so they are always included. |
 | `--cli PATH` | `github-workflow-cli.py` | Path to the CLI. |
 | `--python PATH` | current interpreter | Interpreter used to invoke the CLI. |
-| `--output-dir DIR` | `workflow-output` | A timestamped `sast-bulk-*` or `sca-bulk-*` folder is created per invocation. Reports are written per org, never as one aggregate: `index.md` at the root plus `orgs/<org>/` folders each containing that org's summary, CSV, JSON, and raw run logs, alongside `config-files/<org>/`. |
+| `--output-dir DIR` | `workflow-output` | A timestamped `sast-bulk-*` or `sca-bulk-*` folder is created per invocation. Reports are written per org, never as one aggregate: `index.md` at the root plus `orgs/<org>/` folders each containing that org's summary, CSV, JSON, and raw run logs, plus `config-files/<org>/` when `--fetch-configs` is set. |
 | `--analyze-dir DIR` | | Skip fetching; re-classify previously collected `*-sast-NNN.log` or `*-sca-NNN.log` files. No token needed. Ideal when iterating on rules. |
 | `--include-ok` | off | Also report runs with no observed failure (SAST) or clean gate passes (SCA). |
-| `--fetch-configs` / `--no-fetch-configs` | on | Also save each org's workflow config files from the workflow repo root under `config-files/<org>/` in the output folder. Missing files produce a note, never a failure. |
+| `--fetch-configs` | off | Opt in to also save each org's workflow config files from the workflow repo root under `config-files/<org>/` in the output folder. Missing files produce a note, never a failure. |
 | `--config-file NAME` | `veracode.yml`, `repo-list.yml` | Config file to fetch; repeatable. Overrides the default list when given. Saved flat by base name inside the org folder. |
 | `--fail-fast` | off | Stop on the first collection error instead of continuing. |
 
@@ -268,7 +268,7 @@ and fixed in isolation, with a fleet `index.md` for navigation:
 ```
 workflow-output/sast-bulk-<timestamp>/
   index.md                      # one row per org: runs, failures, top cause, link
-  config-files/
+  config-files/                 # only with --fetch-configs
     <org>/veracode.yml          # plus repo-list.yml when present
   orgs/
     <org>/
@@ -299,6 +299,19 @@ selection chain is defensive end to end:
 The helpers deliberately do not use the CLI's `--name-break` during discovery:
 combined with a conclusion filter it stops at the first page containing any
 match, which can skip a target whose latest failure sits one page deeper.
+
+### Troubleshooting discovery failures
+
+Discovery warnings always include the exit code, the first error line, a
+targeted hint, and the path to the full discovery log. The common systematic
+cases (every org failing the same way) are:
+
+| Symptom in the warning | Cause | Fix |
+|:--|:--|:--|
+| `HTTP 404` / `Not Found` | The central workflow repo is not named `veracode` in your orgs | Set `--workflow-repo NAME`; find the name with `repos --org ORG --csv` |
+| `HTTP 401` / `Bad credentials` | Token missing or invalid in the helper's shell | Export `GITHUB_TOKEN` in the same shell; verify with `token-info` |
+| `HTTP 403` / rate limit | Scope, SSO authorization, or rate limiting | Authorize the token for SSO orgs; check `gh api rate_limit` |
+| `Unable to run gh` | `gh` not on PATH for the helper's environment | Install `gh` or fix PATH |
 
 ### Runner detection
 
@@ -342,7 +355,7 @@ cancellation line never masks the real dependency error underneath it.
 | `orgs/<org>/sast-summary.md` | That org's findings grouped by cause with run link, branch, timestamp, failing job, runner, pipeline progress, evidence line, and the concrete remediation. Cleanup failures sit in a "Secondary issues" section at the bottom and never mask the primary SAST cause. |
 | `orgs/<org>/sast-findings.csv` / `.json` | Full field set per run, including stage statuses, runner fields, and log paths. |
 | `orgs/<org>/logs/` | Raw discovery and per-run logs for that org, so classifications are auditable in place. |
-| `config-files/<org>/` | Each org's `veracode.yml` and `repo-list.yml` (or the `--config-file` list) fetched from the workflow repo root. Cross-reference `default:runs_on` and thresholds against the failures in the same run folder. |
+| `config-files/<org>/` (with `--fetch-configs`) | Each org's `veracode.yml` and `repo-list.yml` (or the `--config-file` list) fetched from the workflow repo root. Cross-reference `default:runs_on` and thresholds against the failures in the same run folder. |
 
 ```bash
 python helpers/bulk-sast-analyzer.py                         # all reachable orgs
@@ -372,8 +385,8 @@ It fetches the complete run log (no `--relevant-only`; SCA job names do not
 match the SAST pipeline patterns) and writes the same per-org layout as the
 SAST helper: a fleet `index.md` (with operational and gate failure counts per
 org) plus `orgs/<org>/` folders containing `sca-summary.md`,
-`sca-findings.csv`, `sca-findings.json`, and the raw logs, alongside
-`config-files/<org>/`. That puts the
+`sca-findings.csv`, `sca-findings.json`, and the raw logs, plus
+`config-files/<org>/` when `--fetch-configs` is set. That puts the
 resolved gate threshold from the logs and the configured
 `break_build_severity_threshold` from `veracode.yml` side by side in one
 output folder.
@@ -399,4 +412,4 @@ any recurring one.
 | Token hygiene | `repo-revert-commit` authenticates with a bare clone URL and an `http.extraheader` injected via the environment (`GIT_CONFIG_*`, git 2.31+), so the token is never written into argv or the temp clone's `.git/config`. The temp dir is removed in a `finally` block. |
 | Sensitive output | `logs` and `contents` print raw output that may contain build secrets. Treat report folders and fetched logs as sensitive artifacts. |
 | API cost | `contents` is a single API call by default; `--with-dates` adds one call per file (N+1), so use it only on small repos or specific paths. Helper discovery is at most `ceil(--limit / 100)` paginated calls per org thanks to the central-repo model (two pages at the default 200). |
-| Runner labels | Run logs contain the resolved runner image, not the literal `default:runs_on` label. The configured label is in the org's `veracode.yml`, which the helpers now save under `config-files/<org>/` automatically. |
+| Runner labels | Run logs contain the resolved runner image, not the literal `default:runs_on` label. The configured label is in the org's `veracode.yml`, which the helpers save under `config-files/<org>/` when run with `--fetch-configs`. |
