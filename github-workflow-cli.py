@@ -783,7 +783,8 @@ def cmd_run_jobs(
         jobs = data.get("jobs", []) if isinstance(data, dict) else []
         writer = csv.writer(sys.stdout)
         writer.writerow(["job_id", "name", "labels", "runner_name",
-                         "runner_group", "status", "conclusion"])
+                         "runner_group", "status", "conclusion",
+                         "started_at", "completed_at"])
         for job in jobs:
             writer.writerow([
                 job.get("id", ""),
@@ -793,7 +794,130 @@ def cmd_run_jobs(
                 job.get("runner_group_name") or "",
                 job.get("status", ""),
                 job.get("conclusion") or "",
+                job.get("started_at") or "",
+                job.get("completed_at") or "",
             ])
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_org_runners(
+    org: str,
+    token: str,
+) -> int:
+    """List the org's SELF-HOSTED runner inventory as CSV.
+
+    The authoritative answer to "is this runner actually mine": any runner
+    name observed on a job but absent from this list is a GitHub-hosted
+    larger runner or an enterprise-level runner, not an org self-hosted one.
+    """
+    env = build_gh_env(token)
+    try:
+        data = run_gh_command(
+            ["gh", "api", f"orgs/{org}/actions/runners?per_page=100"],
+            env=env,
+        )
+        runners = data.get("runners", []) if isinstance(data, dict) else []
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["id", "name", "os", "status", "busy", "labels"])
+        for runner in runners:
+            writer.writerow([
+                runner.get("id", ""),
+                runner.get("name", ""),
+                runner.get("os", ""),
+                runner.get("status", ""),
+                runner.get("busy", ""),
+                ";".join(label.get("name", "")
+                         for label in runner.get("labels", [])),
+            ])
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_runner_groups(
+    org: str,
+    token: str,
+) -> int:
+    """Enumerate the org's runner groups and every runner inside them (CSV).
+
+    Joins three endpoints: runner-groups (group metadata incl. visibility and
+    enterprise inheritance), each group's self-hosted runners (incl.
+    enterprise-shared ones visible through the group), and the org's
+    GitHub-hosted larger runners, which report their runner_group_id and are
+    joined to group names here. source column: self-hosted | hosted-larger.
+    This answers "what is actually in my runner groups" in one call.
+    """
+    env = build_gh_env(token)
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["group_id", "group_name", "visibility", "inherited",
+                     "source", "runner_id", "runner_name", "os_or_platform",
+                     "status", "busy", "labels_or_image"])
+    try:
+        data = run_gh_command(
+            ["gh", "api", f"orgs/{org}/actions/runner-groups?per_page=100"],
+            env=env,
+        )
+        groups = data.get("runner_groups", []) if isinstance(data, dict) else []
+        group_names = {int(g["id"]): g.get("name", "") for g in groups
+                       if g.get("id") is not None}
+        for group in groups:
+            gid = group.get("id", "")
+            gname = group.get("name", "")
+            gvis = group.get("visibility", "")
+            ginherited = group.get("inherited", "")
+            rows_written = 0
+            try:
+                runners_data = run_gh_command(
+                    ["gh", "api",
+                     f"orgs/{org}/actions/runner-groups/{gid}/runners"
+                     f"?per_page=100"],
+                    env=env,
+                )
+                for runner in (runners_data.get("runners", [])
+                               if isinstance(runners_data, dict) else []):
+                    writer.writerow([
+                        gid, gname, gvis, ginherited, "self-hosted",
+                        runner.get("id", ""), runner.get("name", ""),
+                        runner.get("os", ""), runner.get("status", ""),
+                        runner.get("busy", ""),
+                        ";".join(label.get("name", "")
+                                 for label in runner.get("labels", [])),
+                    ])
+                    rows_written += 1
+            except Exception as exc:
+                print(f"Warning: could not list runners for group {gid} "
+                      f"({gname}): {exc}", file=sys.stderr)
+            if rows_written == 0:
+                writer.writerow([gid, gname, gvis, ginherited, "empty",
+                                 "", "", "", "", "", ""])
+        # GitHub-hosted larger runners (endpoint absent on some plans: warn,
+        # do not fail)
+        try:
+            hosted = run_gh_command(
+                ["gh", "api", f"orgs/{org}/actions/hosted-runners?per_page=100"],
+                env=env,
+            )
+            for runner in (hosted.get("runners", [])
+                           if isinstance(hosted, dict) else []):
+                gid = runner.get("runner_group_id", "")
+                image = runner.get("image") or {}
+                size = runner.get("machine_size_details") or {}
+                writer.writerow([
+                    gid,
+                    group_names.get(gid, f"(group {gid})") if gid else "",
+                    "", "", "hosted-larger",
+                    runner.get("id", ""), runner.get("name", ""),
+                    runner.get("platform", ""), runner.get("status", ""), "",
+                    f"image={image.get('id', '')};"
+                    f"size={size.get('id', '')}",
+                ])
+        except Exception as exc:
+            print(f"Warning: hosted larger runners not listable for {org}: "
+                  f"{exc}", file=sys.stderr)
         return 0
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -2891,6 +3015,17 @@ def main() -> int:
         "--repo", required=True, help="Repository (org/repo format)"
     )
 
+    groups_parser = subparsers.add_parser(
+        "runner-groups",
+        help="List runner groups and every runner in them, incl. hosted larger runners (CSV)")
+    groups_parser.add_argument(
+        "--org", required=True, help="Organization login"
+    )
+    runners_parser = subparsers.add_parser(
+        "runners", help="List the org's self-hosted runner inventory (CSV)")
+    runners_parser.add_argument(
+        "--org", required=True, help="Organization login"
+    )
     jobs_parser = subparsers.add_parser(
         "jobs", help="List a run's jobs with requested labels and resolved runner (CSV)")
     jobs_parser.add_argument(
@@ -3159,6 +3294,16 @@ def main() -> int:
             args.id,
             token,
             repo=args.repo,
+        )
+    elif args.command == "runner-groups":
+        return cmd_runner_groups(
+            args.org,
+            token,
+        )
+    elif args.command == "runners":
+        return cmd_org_runners(
+            args.org,
+            token,
         )
     elif args.command == "jobs":
         return cmd_run_jobs(

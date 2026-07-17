@@ -378,6 +378,8 @@ class Finding:
     policy_scan_status: str
     all_codes: str
     failing_job: str
+    queue_seconds: str = ""
+    jobs_duration_seconds: str = ""
     evidence: str
     missing_package: str
     actionable_sast: bool
@@ -421,6 +423,10 @@ def parse_args() -> argparse.Namespace:
                         help="Maximum runs to fetch logs for, per repository")
     parser.add_argument("--failed-only", action=argparse.BooleanOptionalAction, default=True,
                         help="Only analyze failed/cancelled/timed-out runs (default: on)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Per-run log fetch progress and warnings on the "
+                             "console. Default: one aggregate line per repo; "
+                             "full detail is always in the findings CSV.")
     parser.add_argument("--last", type=positive_int, metavar="N",
                         help=("Troubleshoot mode: analyze the newest N runs "
                               "chronologically, success or failure alike. "
@@ -1177,6 +1183,18 @@ def parse_config_runs_on(text: str) -> dict[str, str]:
 
 
 
+GITHUB_HOSTED_LABEL = re.compile(r"^(ubuntu|windows|macos)-", re.I)
+
+
+def looks_github_hosted(label: str) -> bool:
+    """True for GitHub-hosted label shapes (ubuntu-*, windows-*, macos-*).
+
+    Custom self-hosted labels (runner1, build-box) do not match, so runs on
+    custom-labeled runners are not misclassified as hosted.
+    """
+    return bool(GITHUB_HOSTED_LABEL.match(label.strip()))
+
+
 def lint_runs_on(text: str) -> tuple[str, list[str]]:
     """Parse default:runs_on and flag the config mistakes that silently
     disable it. Returns (parsed default value, warnings)."""
@@ -1195,16 +1213,19 @@ def lint_runs_on(text: str) -> tuple[str, list[str]]:
 
 
 def fetch_run_jobs(args: argparse.Namespace, workflow_repo: str, run_id: str) -> dict:
-    """Requested labels and resolved runner per job via the CLI 'jobs' command.
+    """Per-job requested labels and resolved runner via the CLI 'jobs' command.
 
-    The labels are exactly what the Veracode dispatch payload put into
-    runs-on; jobs metadata outlives log retention, so this works even for
-    LOGS_UNAVAILABLE runs.
+    state is per run: 'github-hosted' (all jobs hosted), 'self-hosted' (none),
+    'mixed' (both in one run; hosted_jobs names which ones). Resolved runner
+    group is authoritative (GitHub-hosted always reports group
+    "GitHub Actions"); label shape is the fallback for unplaced jobs. Jobs
+    metadata outlives log retention, so this works for expired-log runs too.
     """
     command = [args.python_executable, str(args.cli), "jobs",
                "--repo", workflow_repo, "--run-id", run_id]
     info: dict = {"labels": set(), "runner_names": set(),
-                  "runner_groups": set(), "hosted": None}
+                  "runner_groups": set(), "state": None, "hosted_jobs": [],
+                  "first_started": "", "last_completed": ""}
     try:
         completed = subprocess.run(command, capture_output=True, text=True,
                                    timeout=300, check=False)
@@ -1212,21 +1233,100 @@ def fetch_run_jobs(args: argparse.Namespace, workflow_repo: str, run_id: str) ->
         return info
     if completed.returncode != 0 or not completed.stdout.strip():
         return info
-    hosted_votes = []
+    votes = []
     for row in csv.DictReader(completed.stdout.splitlines()):
         labels = (row.get("labels") or "").strip()
-        if labels:
-            info["labels"].add(labels)
         name = (row.get("runner_name") or "").strip()
         group = (row.get("runner_group") or "").strip()
+        job_name = (row.get("name") or "").strip()
+        started = (row.get("started_at") or "").strip()
+        completed = (row.get("completed_at") or "").strip()
+        if started and (not info["first_started"]
+                        or started < info["first_started"]):
+            info["first_started"] = started
+        if completed and completed > info["last_completed"]:
+            info["last_completed"] = completed
+        if labels:
+            info["labels"].add(labels)
         if name:
             info["runner_names"].add(name)
         if group:
             info["runner_groups"].add(group)
-            hosted_votes.append(group == "GitHub Actions")
-    if hosted_votes:
-        info["hosted"] = all(hosted_votes)
+            hosted = group == "GitHub Actions"
+        elif labels:
+            hosted = all(looks_github_hosted(part)
+                         for part in labels.split(";"))
+        else:
+            continue
+        votes.append(hosted)
+        if hosted and job_name:
+            info["hosted_jobs"].append(job_name)
+    if votes:
+        if all(votes):
+            info["state"] = "github-hosted"
+        elif not any(votes):
+            info["state"] = "self-hosted"
+        else:
+            info["state"] = "mixed"
     return info
+
+
+def fetch_org_runner_inventory(args: argparse.Namespace,
+                               organization: str) -> dict[str, dict]:
+    """Org self-hosted runner inventory via the CLI 'runners' command.
+
+    name -> {os, status, labels}. Any runner name observed on a job that is
+    NOT in this inventory is a GitHub-hosted larger runner or an
+    enterprise-level runner: hosted infrastructure with a custom group name,
+    which group-based classification alone cannot distinguish.
+    """
+    command = [args.python_executable, str(args.cli), "runners",
+               "--org", organization]
+    inventory: dict[str, dict] = {}
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=300, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return inventory
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return inventory
+    for row in csv.DictReader(completed.stdout.splitlines()):
+        name = (row.get("name") or "").strip()
+        if name:
+            inventory[name] = {
+                "os": (row.get("os") or "").strip(),
+                "status": (row.get("status") or "").strip(),
+                "labels": (row.get("labels") or "").strip(),
+            }
+    return inventory
+
+
+def compute_timings(run_created: str, info: dict) -> tuple[str, str]:
+    """(queue_seconds, jobs_duration_seconds) from ISO timestamps.
+
+    Queue = dispatch to first job start; the single best signal for label
+    mismatch or saturated self-hosted runners. Empty strings when data is
+    missing or malformed rather than guessing.
+    """
+    def parse(stamp: str):
+        try:
+            return dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return None
+    created = parse(run_created)
+    first = parse(info.get("first_started", ""))
+    last = parse(info.get("last_completed", ""))
+    queue = ""
+    duration = ""
+    if created and first:
+        seconds = int((first - created).total_seconds())
+        if seconds >= 0:
+            queue = str(seconds)
+    if first and last:
+        seconds = int((last - first).total_seconds())
+        if seconds >= 0:
+            duration = str(seconds)
+    return queue, duration
 
 
 def apply_jobs_info(finding, info: dict) -> None:
@@ -1235,12 +1335,12 @@ def apply_jobs_info(finding, info: dict) -> None:
         finding.requested_labels = " | ".join(sorted(info["labels"]))
     if info["runner_groups"]:
         finding.runner_group = ";".join(sorted(info["runner_groups"]))
-    if info["hosted"] is True:
-        finding.runner_type = "github-hosted"
-    elif info["hosted"] is False:
-        finding.runner_type = "self-hosted"
-        if info["runner_names"]:
-            finding.runner_name = ";".join(sorted(info["runner_names"]))
+    if info["state"]:
+        finding.runner_type = info["state"]
+    if info["state"] in ("self-hosted", "mixed") and info["runner_names"]:
+        finding.runner_name = ";".join(
+            name for name in sorted(info["runner_names"])
+            if not name.startswith("GitHub Actions"))
 
 
 def write_reports(directory: Path, findings: list[Finding], include_ok: bool) -> None:
@@ -1424,6 +1524,21 @@ def main() -> int:
             expired_runs = 0
             runs_hosted = 0
             runs_selfhosted = 0
+            runs_mixed = 0
+            mixed_hosted_jobs: set[str] = set()
+            failure_categories: dict[str, int] = {}
+            runner_inventory = fetch_org_runner_inventory(args, organization)
+            if runner_inventory:
+                summary = ", ".join(
+                    f"{name} ({facts['os']}, {facts['status']}, "
+                    f"labels: {facts['labels']})"
+                    for name, facts in sorted(runner_inventory.items()))
+                print(f"Self-hosted inventory for {organization}: {summary}")
+            else:
+                print(f"Self-hosted inventory for {organization}: none visible "
+                      f"(no org-level runners, or token lacks "
+                      f"organization_self_hosted_runners:read)")
+            observed_nonhosted_names: set[str] = set()
             payload_labels: set[str] = set()
             stop = False
             for run_meta in candidates:
@@ -1436,22 +1551,31 @@ def main() -> int:
                 command = [args.python_executable, str(args.cli),
                            "logs", "--repo", workflow_repo, "--run-id", run_id,
                            "--relevant-only", "--manifest", str(manifest)]
-                print(f"Fetching build and scan steps: {workflow_repo} run {run_id}")
+                if args.verbose:
+                    print(f"Fetching build and scan steps: {workflow_repo} run {run_id}")
                 log_code, log_output = run_capture(command, log)
                 jobs_info = fetch_run_jobs(args, workflow_repo, run_id)
                 if jobs_info["labels"]:
                     payload_labels.update(jobs_info["labels"])
-                    if any("self-hosted" in label
-                           for label in jobs_info["labels"]):
-                        runs_selfhosted += 1
-                    else:
-                        runs_hosted += 1
+                if jobs_info["state"] == "github-hosted":
+                    runs_hosted += 1
+                elif jobs_info["state"] == "self-hosted":
+                    runs_selfhosted += 1
+                elif jobs_info["state"] == "mixed":
+                    runs_mixed += 1
+                    mixed_hosted_jobs.update(jobs_info["hosted_jobs"])
+                if jobs_info["state"] in ("self-hosted", "mixed"):
+                    observed_nonhosted_names.update(
+                        name for name in jobs_info["runner_names"]
+                        if not name.startswith("GitHub Actions"))
                 category = ("OK" if log_code == 0
                             else log_failure_category(log_code, log_output))
                 if category == "IN_PROGRESS":
                     # Run not finished: no logs exist yet by design. Skip to
                     # the next candidate without recording a failure.
-                    print(f"NOTE: run {run_id} still in progress, trying next candidate")
+                    if args.verbose:
+                        print(f"NOTE: run {run_id} still in progress, "
+                              f"trying next candidate")
                     continue
                 if category == "GONE":
                     # Expired retention is data availability, not a tooling
@@ -1468,21 +1592,26 @@ def main() -> int:
                                               "toward the org's Actions log retention window, "
                                               "or re-trigger the scan for fresh logs.")
                     apply_jobs_info(finding, jobs_info)
+                    finding.queue_seconds, finding.jobs_duration_seconds = (
+                    compute_timings(run_meta.created_at, jobs_info))
                     findings.append(finding)
                     continue
                 if log_code != 0:
                     operational_failures += 1
-                    print(f"WARNING: log fetch failed for {workflow_repo} run {run_id} "
-                          f"({category}, exit {log_code}): {first_error_line(log_output)}",
-                          file=sys.stderr)
-                    if category == "TRANSIENT":
-                        print("  hint: GitHub log backend flaked; the CLI already "
-                              "retried with backoff, re-run later for this run",
-                              file=sys.stderr)
-                    else:
-                        hint = failure_hint(log_output, workflow_repo)
-                        if hint:
-                            print(f"  {hint}", file=sys.stderr)
+                    failure_categories[category] = (
+                        failure_categories.get(category, 0) + 1)
+                    if args.verbose:
+                        print(f"WARNING: log fetch failed for {workflow_repo} run "
+                              f"{run_id} ({category}, exit {log_code}): "
+                              f"{first_error_line(log_output)}", file=sys.stderr)
+                        if category == "TRANSIENT":
+                            print("  hint: GitHub log backend flaked; the CLI "
+                                  "already retried with backoff, re-run later "
+                                  "for this run", file=sys.stderr)
+                        else:
+                            hint = failure_hint(log_output, workflow_repo)
+                            if hint:
+                                print(f"  {hint}", file=sys.stderr)
                     if category == "AUTH":
                         # Every subsequent fetch will fail identically; bail out
                         # of this repo instead of burning the attempts budget.
@@ -1491,6 +1620,8 @@ def main() -> int:
                         finding = classify(log, organization, workflow_repo,
                                            run_meta, None, log_code)
                         apply_jobs_info(finding, jobs_info)
+                        finding.queue_seconds, finding.jobs_duration_seconds = (
+                            compute_timings(run_meta.created_at, jobs_info))
                         findings.append(finding)
                         break
                 else:
@@ -1498,15 +1629,40 @@ def main() -> int:
                 finding = classify(log, organization, workflow_repo, run_meta,
                                    manifest if manifest.is_file() else None, log_code)
                 apply_jobs_info(finding, jobs_info)
+                finding.queue_seconds, finding.jobs_duration_seconds = (
+                    compute_timings(run_meta.created_at, jobs_info))
                 findings.append(finding)
                 if log_code != 0 and args.fail_fast:
                     stop = True
                     break
-            total_checked = runs_hosted + runs_selfhosted
+            if failure_categories and not args.verbose:
+                breakdown = ", ".join(
+                    f"{count} {name}" for name, count in
+                    sorted(failure_categories.items(), key=lambda kv: -kv[1]))
+                print(f"Log fetch issues in {workflow_repo}: {breakdown} "
+                      f"(rerun with --verbose for per-run detail)",
+                      file=sys.stderr)
+            total_checked = runs_hosted + runs_selfhosted + runs_mixed
             if total_checked:
-                print(f"RUNNER CHECK {workflow_repo}: {runs_selfhosted}/{total_checked} "
-                      f"run(s) requested self-hosted labels; payload labels seen: "
+                print(f"RUNNER CHECK {workflow_repo}: {runs_selfhosted} self-hosted, "
+                      f"{runs_mixed} mixed, {runs_hosted} GitHub-hosted of "
+                      f"{total_checked} run(s); payload labels seen: "
                       f"{sorted(payload_labels)}")
+                impostors = observed_nonhosted_names - set(runner_inventory)
+                if impostors and runner_inventory:
+                    print(f"  NOT IN YOUR INVENTORY: {sorted(impostors)} "
+                          f"classified self-hosted by runner group, but absent "
+                          f"from {organization}'s self-hosted runners. These "
+                          f"are GitHub-hosted larger runners or "
+                          f"enterprise-level runners.")
+                if runs_mixed:
+                    print(f"  MIXED: jobs on GitHub-hosted while the rest of the "
+                          f"run was self-hosted: {sorted(mixed_hosted_jobs)}")
+                    if any("build" in job.lower() for job in mixed_hosted_jobs):
+                        print("  => build jobs use build_runs_on from "
+                              "actions:<scan_type>:build:runs_on, not "
+                              "default:runs_on; set that key in this org's "
+                              "veracode.yml")
                 config = (result_dir / "config-files"
                           / safe_target_name(organization) / "veracode.yml")
                 if config.is_file():
@@ -1516,7 +1672,11 @@ def main() -> int:
                           f"{default_value or '(not set)'}")
                     for warning in lint_warnings:
                         print(f"  CONFIG LINT: {warning}")
-                    wants_self = "self-hosted" in default_value.lower()
+                    config_labels = [part.strip()
+                                     for part in default_value.split(",")
+                                     if part.strip()]
+                    wants_self = bool(config_labels) and not all(
+                        looks_github_hosted(part) for part in config_labels)
                     if wants_self and runs_hosted == total_checked:
                         print("  => PROOF: config asks for self-hosted but no dispatch "
                               "payload contained self-hosted labels. The app reads "
