@@ -444,6 +444,31 @@ def failure_hint(output: str, workflow_repo: str) -> str:
                 "the helper falls back to newer candidates automatically")
     return ""
 
+# Mirror of LOG_ERROR_EXIT_CODES in github-workflow-cli.py.
+EXIT_GONE, EXIT_IN_PROGRESS, EXIT_TRANSIENT, EXIT_AUTH, EXIT_NOT_FOUND = 4, 5, 6, 7, 8
+
+
+def log_failure_category(exit_code: int, output: str) -> str:
+    """Categorize a log fetch failure: exit code first, text markers second.
+
+    The CLI emits Error[CATEGORY] markers and category exit codes; the text
+    fallback keeps this working against an older CLI copy.
+    """
+    by_code = {EXIT_GONE: "GONE", EXIT_IN_PROGRESS: "IN_PROGRESS",
+               EXIT_TRANSIENT: "TRANSIENT", EXIT_AUTH: "AUTH",
+               EXIT_NOT_FOUND: "NOT_FOUND"}
+    if exit_code in by_code:
+        return by_code[exit_code]
+    marker = re.search(r"Error\[(GONE|IN_PROGRESS|TRANSIENT|AUTH|NOT_FOUND)\]", output)
+    if marker:
+        return marker.group(1)
+    if logs_unavailable(output):
+        return "GONE"
+    if re.search(r"still in progress", output, re.I):
+        return "IN_PROGRESS"
+    return "UNKNOWN"
+
+
 def logs_unavailable(output: str) -> bool:
     """True when the failure is expired/deleted run logs, not a real error.
 
@@ -1178,7 +1203,14 @@ def main() -> int:
                            "logs", "--repo", workflow_repo, "--run-id", run_id]
                 print(f"Fetching run log: {workflow_repo} run {run_id}")
                 log_code, log_output = run_capture(command, log)
-                if log_code != 0 and logs_unavailable(log_output):
+                category = ("OK" if log_code == 0
+                            else log_failure_category(log_code, log_output))
+                if category == "IN_PROGRESS":
+                    # Run not finished: no logs exist yet by design. Skip to
+                    # the next candidate without recording a failure.
+                    print(f"NOTE: run {run_id} still in progress, trying next candidate")
+                    continue
+                if category == "GONE":
                     # Expired retention is data availability, not a tooling
                     # failure: record it, try the next-newest candidate, and do
                     # not flip the helper exit code for it.
@@ -1196,10 +1228,24 @@ def main() -> int:
                 if log_code != 0:
                     operational_failures += 1
                     print(f"WARNING: log fetch failed for {workflow_repo} run {run_id} "
-                          f"(exit {log_code}): {first_error_line(log_output)}", file=sys.stderr)
-                    hint = failure_hint(log_output, workflow_repo)
-                    if hint:
-                        print(f"  {hint}", file=sys.stderr)
+                          f"({category}, exit {log_code}): {first_error_line(log_output)}",
+                          file=sys.stderr)
+                    if category == "TRANSIENT":
+                        print("  hint: GitHub log backend flaked; the CLI already "
+                              "retried with backoff, re-run later for this run",
+                              file=sys.stderr)
+                    else:
+                        hint = failure_hint(log_output, workflow_repo)
+                        if hint:
+                            print(f"  {hint}", file=sys.stderr)
+                    if category == "AUTH":
+                        # Every subsequent fetch will fail identically; bail out
+                        # of this repo instead of burning the attempts budget.
+                        print(f"  aborting remaining fetches for {workflow_repo}: "
+                              f"auth failures repeat", file=sys.stderr)
+                        findings.append(classify(log, organization, workflow_repo,
+                                                 run_meta, log_code))
+                        break
                 else:
                     fetched += 1
                 findings.append(classify(log, organization, workflow_repo, run_meta, log_code))
