@@ -761,6 +761,45 @@ def cmd_logs(
         return 1
 
 
+def cmd_run_jobs(
+    run_id: int,
+    token: str,
+    repo: str,
+) -> int:
+    """List each job's requested labels and resolved runner as CSV.
+
+    The labels column is the literal runs-on the job asked for, i.e. exactly
+    what the Veracode dispatch payload contained; runner_name/runner_group is
+    where GitHub actually placed the job. Jobs metadata outlives log
+    retention, so this remains provable after logs expire.
+    """
+    env = build_gh_env(token)
+    try:
+        data = run_gh_command(
+            ["gh", "api",
+             f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"],
+            env=env,
+        )
+        jobs = data.get("jobs", []) if isinstance(data, dict) else []
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["job_id", "name", "labels", "runner_name",
+                         "runner_group", "status", "conclusion"])
+        for job in jobs:
+            writer.writerow([
+                job.get("id", ""),
+                job.get("name", ""),
+                ";".join(job.get("labels") or []),
+                job.get("runner_name") or "",
+                job.get("runner_group_name") or "",
+                job.get("status", ""),
+                job.get("conclusion") or "",
+            ])
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_issues(
     repo: str,
     token: str,
@@ -2852,6 +2891,14 @@ def main() -> int:
         "--repo", required=True, help="Repository (org/repo format)"
     )
 
+    jobs_parser = subparsers.add_parser(
+        "jobs", help="List a run's jobs with requested labels and resolved runner (CSV)")
+    jobs_parser.add_argument(
+        "--run-id", type=int, required=True, help="Workflow run ID"
+    )
+    jobs_parser.add_argument(
+        "--repo", required=True, help="Repository (org/repo format)"
+    )
     logs_parser = subparsers.add_parser("logs", help="Fetch workflow logs")
     logs_parser.add_argument(
         "--run-id", type=int, required=True, help="Workflow run ID (use the 'id' column from workflows output)"
@@ -3110,6 +3157,12 @@ def main() -> int:
     elif args.command == "run":
         return cmd_run_view(
             args.id,
+            token,
+            repo=args.repo,
+        )
+    elif args.command == "jobs":
+        return cmd_run_jobs(
+            args.run_id,
             token,
             repo=args.repo,
         )
