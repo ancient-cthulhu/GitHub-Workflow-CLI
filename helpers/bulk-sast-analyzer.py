@@ -914,7 +914,6 @@ def classify(path: Path, organization: str, workflow_repo: str, run_meta: RunMet
     cleanup_text = select_job_lines(text, cleanup_jobs) if cleanup_jobs else ""
     actionable_sast = bool(sast_jobs and sast_text.strip())
     cleanup_code, cleanup_evidence = classify_cleanup(cleanup_text, text)
-    runner = detect_runner(text)
 
     # Critical: primary SAST rules are evaluated only against SAST job lines.
     matches = [(rule, matching_line(sast_text, rule.patterns)) for rule in RULES
@@ -965,6 +964,13 @@ def classify(path: Path, organization: str, workflow_repo: str, run_meta: RunMet
 
     failing_job = (failing_job_for(sast_text, primary.patterns) if primary.patterns
                    else line_job_name(evidence))
+    # Runner attribution: a run can span multiple runners (one per job), so
+    # detect the runner from the failing job's own "Set up job" block. Fall
+    # back to SAST job lines, then the whole log, only when scoping fails.
+    runner_scope = select_job_lines(text, [failing_job]) if failing_job else ""
+    runner = detect_runner(runner_scope) if runner_scope else RunnerInfo()
+    if not (runner.runner_image or runner.runner_name):
+        runner = detect_runner(sast_text or text)
     effective_stage = primary.stage
     # Generic run-level rules (runner lost, timeout, cancel) land in "results";
     # pin the stage to where the failing job actually sat when we can tell.
@@ -1296,7 +1302,7 @@ def fetch_run_jobs(args: argparse.Namespace, workflow_repo: str, run_id: str) ->
                "--repo", workflow_repo, "--run-id", run_id]
     info: dict = {"labels": set(), "runner_names": set(),
                   "runner_groups": set(), "state": None, "hosted_jobs": [],
-                  "first_started": "", "last_completed": ""}
+                  "first_started": "", "last_completed": "", "jobs": {}}
     try:
         completed = subprocess.run(command, capture_output=True, text=True,
                                    timeout=300, check=False)
@@ -1321,6 +1327,10 @@ def fetch_run_jobs(args: argparse.Namespace, workflow_repo: str, run_id: str) ->
             info["labels"].add(labels)
         if name:
             info["runner_names"].add(name)
+        if job_name:
+            info["jobs"][job_name] = {
+                "labels": labels, "runner_name": name, "runner_group": group,
+            }
         if group:
             info["runner_groups"].add(group)
             hosted = group == "GitHub Actions"
@@ -1400,8 +1410,48 @@ def compute_timings(run_created: str, info: dict) -> tuple[str, str]:
     return queue, duration
 
 
+def failing_job_facts(info: dict, failing_job: str) -> dict:
+    """API-sourced runner facts for the failing job, matched by name.
+
+    Log job columns and API job names usually match exactly; reusable
+    workflows can differ slightly, so fall back to case-insensitive and
+    substring matching before giving up.
+    """
+    jobs = info.get("jobs") or {}
+    if not failing_job or not jobs:
+        return {}
+    if failing_job in jobs:
+        return jobs[failing_job]
+    lowered = failing_job.lower()
+    for name, facts in jobs.items():
+        if name.lower() == lowered:
+            return facts
+    for name, facts in jobs.items():
+        candidate = name.lower()
+        if candidate in lowered or lowered in candidate:
+            return facts
+    return {}
+
+
 def apply_jobs_info(finding, info: dict) -> None:
-    """Prefer API-sourced runner facts over log scraping on the finding."""
+    """Prefer API-sourced runner facts over log scraping on the finding.
+
+    Attribution order: the failing job's own runner facts first (a run can
+    span multiple runners), then run-level aggregates only as a fallback.
+    """
+    facts = failing_job_facts(info, getattr(finding, "failing_job", ""))
+    if facts:
+        if facts["labels"]:
+            finding.requested_labels = facts["labels"]
+        if facts["runner_group"]:
+            finding.runner_group = facts["runner_group"]
+        if facts["runner_group"] == "GitHub Actions":
+            finding.runner_type = "github-hosted"
+        elif facts["runner_name"]:
+            finding.runner_type = "self-hosted"
+        if facts["runner_name"] and not facts["runner_name"].startswith("GitHub Actions"):
+            finding.runner_name = facts["runner_name"]
+        return
     if info["labels"]:
         finding.requested_labels = " | ".join(sorted(info["labels"]))
     if info["runner_groups"]:
