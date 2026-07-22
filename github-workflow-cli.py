@@ -514,25 +514,53 @@ def cmd_run_view(
         return 1
 
 
+# Matched against each "/"-separated segment of the gh job column so that
+# reusable-workflow names like "Static Code Analysis / scan" and jobs that do
+# not begin with the token (e.g. "SAST Scan") are still recognized.
 SAST_RELEVANT_JOB_PATTERNS = (
-    r"^Validations(?:\s*/|$)",
-    r"^build(?:\s*/|$)",
-    r"^package(?:\s*/|$)",
-    r"^packager(?:\s*/|$)",
-    r"^artifact(?:\s*/|$)",
-    r"^upload(?:\s*/|$)",
-    r"^prescan(?:\s*/|$)",
-    r"^pre.?scan(?:\s*/|$)",
-    r"^pipeline_scan(?:\s*/|$)",
-    r"^policy_scan(?:\s*/|$)",
-    r"^scan(?:\s*/|$)",
-    r"^results?(?:\s*/|$)",
+    r"^validations?\b",
+    r"^build\b",
+    r"^packager?\b",
+    r"^artifact\b",
+    r"^upload\b",
+    r"^pre.?scan\b",
+    r"^pipeline.?scan\b",
+    r"^policy.?scan\b",
+    r"^scan\b",
+    r"^results?\b",
+    r"\bstatic.?(?:code.?)?analysis\b",
+    r"\bsast\b",
+    r"\bveracode\b",
+    r"\bsecurity.?scan\b",
+    r"\bcode.?analysis\b",
+    r"\banaly[sz]e\b",
 )
 
 SAST_EXCLUDED_JOB_PATTERNS = (
-    r"^cleanup(?:\s*/|$)",
-    r"^register(?:\s*/|$)",
+    r"^cleanup\b",
+    r"^register\b",
 )
+
+
+def job_name_segments(job_name: str) -> list[str]:
+    """Split a gh job column into "/"-separated segments (reusable workflows)."""
+    return [segment.strip() for segment in job_name.split("/") if segment.strip()]
+
+
+def is_sast_job(job_name: str) -> bool:
+    return any(
+        re.search(pattern, segment, re.I)
+        for segment in job_name_segments(job_name)
+        for pattern in SAST_RELEVANT_JOB_PATTERNS
+    )
+
+
+def is_excluded_job(job_name: str) -> bool:
+    return any(
+        re.search(pattern, segment, re.I)
+        for segment in job_name_segments(job_name)
+        for pattern in SAST_EXCLUDED_JOB_PATTERNS
+    )
 
 
 # Log-fetch failure categories, mapped to distinct process exit codes by
@@ -651,8 +679,11 @@ def filter_sast_workflow_logs(
             continue
         if job_name not in all_jobs:
             all_jobs.append(job_name)
-        is_cleanup = bool(re.search(r"^cleanup(?:\s*/|$)", job_name, re.I))
-        is_sast = any(re.search(p, job_name, re.I) for p in SAST_RELEVANT_JOB_PATTERNS)
+        is_cleanup = any(
+            re.search(r"^cleanup\b", segment, re.I)
+            for segment in job_name_segments(job_name)
+        )
+        is_sast = not is_excluded_job(job_name) and is_sast_job(job_name)
         if is_cleanup:
             cleanup_lines.append(line)
             if job_name not in cleanup_jobs:
@@ -683,8 +714,13 @@ def filter_sast_workflow_logs(
         }
 
     # Never convert a successful download into a collection failure.
+    # Prefer the unrecognized (other) job lines over cleanup so a scan job
+    # with an unanticipated name is preserved instead of silently dropped.
     if not output_lines:
-        output_lines = cleanup_lines or other_lines
+        output_lines = other_lines or cleanup_lines
+    elif relevant_only and not sast_lines and other_lines:
+        # Only cleanup matched but other jobs exist: keep them for triage.
+        output_lines = other_lines + output_lines
     filtered = "\n".join(output_lines)
     if filtered:
         filtered += "\n"
