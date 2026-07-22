@@ -391,6 +391,7 @@ class Finding:
     collection_exit_code: int
     queue_seconds: str = ""
     jobs_duration_seconds: str = ""
+    evidence_context: str = ""
 
 
 def positive_int(value: str) -> int:
@@ -423,6 +424,11 @@ def parse_args() -> argparse.Namespace:
                         help="Maximum runs to fetch logs for, per repository")
     parser.add_argument("--failed-only", action=argparse.BooleanOptionalAction, default=True,
                         help="Only analyze failed/cancelled/timed-out runs (default: on)")
+    parser.add_argument("--full-logs", action=argparse.BooleanOptionalAction, default=True,
+                        help=("Store the complete run lifecycle (every job, checkout through "
+                              "cleanup) in the local .log file (default: on). Classification "
+                              "still scopes primary rules to the SAST jobs via the manifest. "
+                              "--no-full-logs restores the old filtered --relevant-only capture."))
     parser.add_argument("--verbose", action="store_true",
                         help="Per-run log fetch progress and warnings on the "
                              "console. Default: one aggregate line per repo; "
@@ -780,15 +786,34 @@ def select_job_lines(text: str, job_names: list[str]) -> str:
     )
 
 
+# Keep in sync with SAST_RELEVANT_JOB_PATTERNS in github-workflow-cli.py.
+SAST_JOB_SEGMENT_PATTERNS = (
+    r"^validations?\b", r"^build\b", r"^packager?\b", r"^artifact\b",
+    r"^upload\b", r"^pre.?scan\b", r"^pipeline.?scan\b", r"^policy.?scan\b",
+    r"^scan\b", r"^results?\b",
+    r"\bstatic.?(?:code.?)?analysis\b", r"\bsast\b", r"\bveracode\b",
+    r"\bsecurity.?scan\b", r"\bcode.?analysis\b", r"\banaly[sz]e\b",
+)
+
+
+def job_name_segments(job_name: str) -> list[str]:
+    return [segment.strip() for segment in job_name.split("/") if segment.strip()]
+
+
+def is_cleanup_job(job_name: str) -> bool:
+    return any(re.search(r"^cleanup\b", segment, re.I)
+               for segment in job_name_segments(job_name))
+
+
 def infer_sast_jobs(text: str) -> list[str]:
     jobs: list[str] = []
-    pattern = re.compile(
-        r"^(?:Validations|build|package|packager|artifact|upload|prescan|pre.?scan|pipeline_scan|policy_scan|scan|results?)(?:\s*/|$)",
-        re.I,
-    )
     for line in text.splitlines():
         name = line_job_name(line)
-        if name and pattern.search(name) and name not in jobs:
+        if not name or name in jobs or is_cleanup_job(name):
+            continue
+        if any(re.search(pattern, segment, re.I)
+               for segment in job_name_segments(name)
+               for pattern in SAST_JOB_SEGMENT_PATTERNS):
             jobs.append(name)
     return jobs
 
@@ -797,9 +822,41 @@ def infer_cleanup_jobs(text: str) -> list[str]:
     jobs: list[str] = []
     for line in text.splitlines():
         name = line_job_name(line)
-        if name and re.search(r"^cleanup(?:\s*/|$)", name, re.I) and name not in jobs:
+        if name and is_cleanup_job(name) and name not in jobs:
             jobs.append(name)
     return jobs
+
+
+def strip_ansi(line: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", line)
+
+
+def evidence_context(text: str, evidence: str, job_name: str = "",
+                     before: int = 20, after: int = 5,
+                     max_chars: int = 4000) -> str:
+    """Return the log lines surrounding the evidence line, scoped to the
+    failing job when known, so the failure is fixable without reopening the
+    raw log. Uses the last occurrence to mirror first_sast_error()."""
+    if not evidence:
+        return ""
+    needle = evidence.strip()[-200:]
+    if not needle:
+        return ""
+    lines = text.splitlines()
+    if job_name:
+        scoped = [line for line in lines if line_job_name(line) == job_name]
+        if scoped:
+            lines = scoped
+    idx = None
+    for i, line in enumerate(lines):
+        if needle in strip_ansi(line):
+            idx = i
+    if idx is None:
+        return ""
+    start = max(0, idx - before)
+    end = min(len(lines), idx + after + 1)
+    block = "\n".join(line_content(line) for line in lines[start:end])
+    return block[-max_chars:]
 
 
 def first_sast_error(text: str) -> str:
@@ -888,9 +945,15 @@ def classify(path: Path, organization: str, workflow_repo: str, run_meta: RunMet
             result = "SAST_NO_FAILURE_OBSERVED"
         codes = primary.code
     elif cleanup_jobs:
+        other_jobs = [name for name in (metadata.get("other_jobs") or [])
+                      if name not in cleanup_jobs]
         primary = Rule("NO_ACTIONABLE_SAST_LOGS", "collection", "Run has cleanup but no build or scan jobs", "info",
-                       "Record cleanup separately and inspect another run for the same target.", (), 999)
+                       "Record cleanup separately and inspect another run for the same target. "
+                       "If other jobs are listed in the evidence, add their names to the SAST job patterns.",
+                       (), 999)
         evidence = cleanup_evidence or "Cleanup job was present; no SAST jobs were present."
+        if other_jobs:
+            evidence += f" Unrecognized non-cleanup jobs in this run: {', '.join(other_jobs)}"
         codes = primary.code
         result = "CLEANUP_ONLY"
     else:
@@ -960,6 +1023,7 @@ def classify(path: Path, organization: str, workflow_repo: str, run_meta: RunMet
         log_file=str(path),
         manifest_file=str(manifest) if manifest else "",
         collection_exit_code=collection_exit_code,
+        evidence_context=evidence_context(text, evidence, failing_job),
     )
 
 
@@ -1062,6 +1126,13 @@ def write_markdown(directory: Path, rows: list[Finding], scope: str = "") -> Non
                 detail.append(f"  - Missing package: `{row.missing_package}`")
             detail.append(f"  - Evidence: `{row.evidence}`" if row.evidence
                           else "  - Evidence: no known signature")
+            if row.evidence_context:
+                detail.append("  - Failure context:")
+                detail.append("")
+                detail.append("    ```text")
+                detail.extend(f"    {line}" for line in row.evidence_context.splitlines())
+                detail.append("    ```")
+                detail.append("")
             if row.all_codes and ";" in row.all_codes:
                 detail.append(f"  - Other signals: `{row.all_codes}`")
             detail.append(f"  - Local log: `{row.log_file}`")
@@ -1550,9 +1621,13 @@ def main() -> int:
                 manifest = logs_dir / f"{target_name}-sast-{run_id}-jobs.json"
                 command = [args.python_executable, str(args.cli),
                            "logs", "--repo", workflow_repo, "--run-id", run_id,
-                           "--relevant-only", "--manifest", str(manifest)]
+                           "--manifest", str(manifest)]
+                if not args.full_logs:
+                    command.append("--relevant-only")
                 if args.verbose:
-                    print(f"Fetching build and scan steps: {workflow_repo} run {run_id}")
+                    scope_note = ("full run lifecycle" if args.full_logs
+                                  else "build and scan steps")
+                    print(f"Fetching {scope_note}: {workflow_repo} run {run_id}")
                 log_code, log_output = run_capture(command, log)
                 jobs_info = fetch_run_jobs(args, workflow_repo, run_id)
                 if jobs_info["labels"]:
