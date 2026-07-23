@@ -344,6 +344,7 @@ class RunMeta:
     created_at: str = ""
     conclusion: str = ""
     name: str = ""
+    display_title: str = ""
 
 
 @dataclass
@@ -410,13 +411,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--targets", type=Path,
         help=("Optional target file with one org/repo or organization per line. "
-              "An organization-only entry processes every repository in that "
-              "organization. Omit to auto-discover all accessible organizations."),
+              "Both forms query <org>/<workflow-repo>; an org/repo entry narrows "
+              "that repo's runs to the ones whose display title names the source "
+              "repository. Omit to auto-discover all accessible organizations."),
     )
     parser.add_argument("--workflow-repo", "--repo", dest="workflow_repo", default="veracode",
                         help=("Name of the central repository that hosts the Veracode workflows "
-                              "in each organization (default: veracode). Bare organization targets "
-                              "map to <org>/<workflow-repo>."))
+                              "in each organization (default: veracode). All targets map to "
+                              "<org>/<workflow-repo>; the repo half of an org/repo target is "
+                              "used as a source-repository filter, not as a run source."))
     parser.add_argument("--limit", type=positive_int, default=200,
                         help="Maximum workflow runs to list per repository during discovery")
     parser.add_argument("--runs-per-repo", "--runs-per-org", dest="runs_per_repo",
@@ -597,6 +600,7 @@ def extract_runs(output: str) -> list[RunMeta]:
                     created_at=(row.get("created") or "").strip(),
                     conclusion=(row.get("conclusion") or "").strip(),
                     name=(row.get("name") or "").strip(),
+                    display_title=(row.get("display_title") or "").strip(),
                 ))
     except csv.Error:
         pass
@@ -615,6 +619,7 @@ def extract_runs(output: str) -> list[RunMeta]:
                     conclusion=columns[4] if len(columns) > 4 else "",
                     created_at=columns[5] if len(columns) > 5 else "",
                     branch=columns[8] if len(columns) > 8 else "",
+                    display_title=columns[9] if len(columns) > 9 else "",
                 ))
     if not runs:
         for run_id in re.findall(r"/actions/runs/(\d{6,20})", output):
@@ -1571,21 +1576,27 @@ def main() -> int:
             if not requested_targets:
                 return 2
 
-        workflow_repositories: list[str] = []
+        # Every target resolves to the organization's central workflow
+        # repository. The Veracode workflows exist only there and scan the
+        # org's other repositories as sources, so an org/repo target names a
+        # scan *source*, not a repository that holds runs of its own. The repo
+        # half becomes a display-title filter applied during discovery.
+        workflow_targets: list[tuple[str, str]] = []
         for target in requested_targets:
-            # Explicit org/repo targets are used as-is. A bare organization
-            # maps directly to its central workflow repository (the Veracode
-            # workflows run only there and scan the org's other repositories
-            # as sources), so there is no need to enumerate every repo.
-            if "/" in target:
-                workflow_repositories.append(target)
-            else:
-                workflow_repositories.append(f"{target}/{args.workflow_repo}")
+            organization, _, repository = target.partition("/")
+            source_filter = "" if repository in ("", args.workflow_repo) else repository
+            workflow_targets.append((f"{organization}/{args.workflow_repo}", source_filter))
+
+        # A whole-org target subsumes any per-repo target for the same org.
+        whole_org = {repo for repo, flt in workflow_targets if not flt}
+        workflow_targets = [pair for pair in dict.fromkeys(workflow_targets)
+                            if not (pair[1] and pair[0] in whole_org)]
 
         fetched_config_orgs: set[str] = set()
-        for workflow_repo in dict.fromkeys(workflow_repositories):
+        for workflow_repo, source_filter in workflow_targets:
             organization = workflow_repo.split("/", 1)[0]
-            target_name = safe_target_name(workflow_repo)
+            target_name = safe_target_name(
+                f"{workflow_repo}-{source_filter}" if source_filter else workflow_repo)
             logs_dir = result_dir / "orgs" / safe_target_name(organization) / "logs"
             logs_dir.mkdir(parents=True, exist_ok=True)
             if args.fetch_configs:
@@ -1597,7 +1608,10 @@ def main() -> int:
             if args.failed_only:
                 discovery.extend(["--conclusion",
                                   "failure,cancelled,timed_out,action_required,startup_failure,stale"])
-            print(f"Discovering: {workflow_repo}")
+            if source_filter:
+                discovery.extend(["--display-title", source_filter])
+            print(f"Discovering: {workflow_repo}"
+                  + (f" (source repo: {source_filter})" if source_filter else ""))
             code, output = run_capture(discovery, discovery_file)
             if code != 0:
                 operational_failures += 1
@@ -1626,6 +1640,11 @@ def main() -> int:
             if not matched:
                 print(f"NOTE: no matching runs in the newest {args.limit} runs of "
                       f"{workflow_repo}; if failures are older, raise --limit")
+                if source_filter:
+                    print(f"  the source filter '{source_filter}' matches against each "
+                          f"run's display title, so it only works when the workflow "
+                          f"sets a run-name carrying the source repository; drop the "
+                          f"repo half of the target to scan all of {workflow_repo}")
             elif not selected_runs:
                 print(f"NOTE: {matched} matching run(s) in {workflow_repo} but all older "
                       f"than {args.max_age_days} days; raise --max-age-days to include them")
