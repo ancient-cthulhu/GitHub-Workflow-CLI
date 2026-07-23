@@ -172,6 +172,7 @@ class WorkflowRun:
     started_at: str
     updated_at: str
     head_branch: str
+    display_title: str = ""
 
 
 @dataclass
@@ -356,6 +357,7 @@ def cmd_workflows(
     conclusion: str | None = None,
     name_filter: str | None = None,
     name_filter_break: bool | None = None,
+    display_title_filter: str | None = None,
     limit: int = 100,
     output_format: str = "table",
 ) -> int:
@@ -403,6 +405,13 @@ def cmd_workflows(
                 name = item.get("name", "")
                 if name_filter and name_filter.lower() not in name.lower():
                     continue
+                display_title = item.get("display_title", "")
+                # Filter by run display title if specified. The central Veracode
+                # workflow repo runs one workflow for many source repositories,
+                # so the display title is the only pre-log signal of which
+                # source repo a run scanned.
+                if display_title_filter and display_title_filter.lower() not in display_title.lower():
+                    continue
                 item_conclusion = item.get("conclusion")
                 # Filter by conclusion if specified
                 if allowed_conclusions and item_conclusion not in allowed_conclusions:
@@ -418,6 +427,7 @@ def cmd_workflows(
                         started_at=item.get("run_started_at", ""),
                         updated_at=item.get("updated_at", ""),
                         head_branch=item.get("head_branch", ""),
+                        display_title=display_title,
                     )
                 
                 data.append(run)
@@ -429,7 +439,7 @@ def cmd_workflows(
             total_fetched += len(workflow_runs)
 
         if output_format == "csv":
-            headers = ["number", "id", "name", "status", "conclusion", "created", "started", "updated", "branch"]
+            headers = ["number", "id", "name", "status", "conclusion", "created", "started", "updated", "branch", "display_title"]
             rows = [
                 [
                     r.number,
@@ -441,13 +451,14 @@ def cmd_workflows(
                     r.started_at,
                     r.updated_at,
                     r.head_branch,
+                    r.display_title,
                 ]
                 for r in data
             ]
             output = format_csv(headers, rows)
             print(output, end="")
         else:
-            headers = ["number", "id", "name", "status", "conclusion", "created", "started", "updated", "branch"]
+            headers = ["number", "id", "name", "status", "conclusion", "created", "started", "updated", "branch", "display_title"]
             rows = [
                 [
                     r.number,
@@ -459,6 +470,7 @@ def cmd_workflows(
                     r.started_at,
                     r.updated_at,
                     r.head_branch,
+                    r.display_title,
                 ]
                 for r in data
             ]
@@ -3032,6 +3044,13 @@ def main() -> int:
         action=argparse.BooleanOptionalAction
     )
     workflows_parser.add_argument(
+        "--display-title",
+        help=("Filter by run display title (case-insensitive substring match). "
+              "Use this to narrow a central workflow repository's runs to one "
+              "source repository, which requires the workflow to set a run-name "
+              "that carries the source repository."),
+    )
+    workflows_parser.add_argument(
         "--limit", type=int, default=10000, help="Maximum number of runs to list (default: 10000, fetches all)"
     )
     workflows_parser.add_argument(
@@ -3321,6 +3340,7 @@ def main() -> int:
             status=args.status,
             conclusion=args.conclusion,
             name_filter=args.name,
+            display_title_filter=args.display_title,
             limit=args.limit,
             output_format=args.output_format,
             name_filter_break=args.name_break
